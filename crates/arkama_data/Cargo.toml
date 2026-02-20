@@ -1,0 +1,11 @@
+[package]
+name = "arkama_data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arkama_core = { path = "../arkama_core" }
+directories = "5"
+eyre.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+tracing.workspace = true
