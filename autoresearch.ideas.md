@@ -1,0 +1,3 @@
+- Replace per-segment `update_state` mutex writes with per-segment atomics + periodic snapshot materialization in saver task. Goal: remove hot-path async mutex contention while preserving resumable state correctness.
+- Add dedicated integrity e2e test that verifies downloaded file bytes (not just length) for segmented mode; keep benchmark test separate to avoid metric distortion.
+- Revisit `SlowestTracker` duplicate-duration correctness fix using low-overhead representation (e.g., `(Duration, seq)` ordering) and validate perf impact specifically in `experimental_entropy` mode.

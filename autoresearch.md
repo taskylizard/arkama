@@ -26,15 +26,25 @@ Optimize download runtime in `arkama_core` while preserving behavior correctness
 - Required checks sequence: `cargo check` -> `cargo test` -> `cargo clippy --fix --allow-dirty` -> `cargo fmt`.
 
 ## What's Been Tried
-- Initial benchmark setup on `arkama` crate failed due missing OpenSSL headers in env. Switched workspace `reqwest` to `default-features = false` + `rustls-tls` only.
-- Added `crates/arkama_core/tests/download_e2e.rs` with local Hyper server and segmented download correctness/perf signal.
-- Stabilized signal by using median-of-3 and amplifying workload (`download_segmented_large_payload` now performs 6 downloads per run).
-- **Best kept optimization:** batch segmented `update_state` writes every 64KiB and add direct id-index fast path in `update_state` (`crates/arkama_core/src/downloader.rs`).
-  - Baseline (current workload): `355ms`
-  - Best kept: `316ms` (~11% faster)
-- Discarded variants:
-  - Per-stream one-time seek (worse)
-  - Batch size tuning at 32KiB/128KiB/256KiB (all worse than 64KiB)
-  - Removing read flags on file opens (no gain)
-  - Compact JSON + delayed first periodic tick (worse)
-  - SlowestTracker duplicate-duration correctness fix (no primary gain on this workload)
+- Initial setup issue: `arkama` integration benchmark path failed due missing OpenSSL headers; fixed by switching workspace `reqwest` to `default-features = false` + `rustls-tls`.
+- Added local integration workload in `crates/arkama_core/tests/download_e2e.rs`.
+- Benchmark evolved to reduce overfitting/noise:
+  - cargo-test driven median-of-3
+  - then direct test-binary median-of-3
+  - now direct test-binary **warm-up + median-of-5** (`autoresearch.sh`).
+- Current segment baseline (warm-up + median-of-5): **153ms**.
+- Kept code optimizations in `crates/arkama_core/src/downloader.rs`:
+  - Batched segmented state sync + id-index fast path in `update_state`.
+  - Removed redundant hot-loop `ensure_parent_dir` calls; create parent once before loops.
+  - Skipped redundant immediate periodic-save tick (initial explicit `save_state` already done).
+  - Tuned `STATE_SYNC_BATCH_BYTES`: 64KiB -> 96KiB -> 88KiB -> **84KiB**.
+  - Removed unnecessary `.read(true)` flags from output file open options.
+- Current head: `4d5966c` on `autoresearch/perf-correctness-2026-03-18`.
+- Observed high ambient jitter (roughly 120–155ms band on calibration runs). Treat sub-3ms differences as noise; prefer larger deltas or repeated confirmation.
+- Discarded ideas so far:
+  - One-time seek per segment stream (large regression)
+  - `Response::chunk()` refactor (no gain)
+  - Progress-event shortcut when no subscribers (regressed)
+  - Compact JSON state serialization (`to_vec`) (no gain)
+  - `try_lock` opportunistic state updates (no gain)
+  - Further batch-size sweeps not beating 84KiB (e.g., 80/82/92/112KiB)
