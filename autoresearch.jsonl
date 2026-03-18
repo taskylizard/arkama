@@ -1,0 +1,3 @@
+{"type":"config","name":"Arkama download performance + correctness","metricName":"download_e2e_ms","metricUnit":"ms","bestDirection":"lower"}
+{"run":1,"commit":"87d9d2c","metric":0,"metrics":{},"status":"crash","description":"Initial baseline command failed: benchmark targeted crate arkama integration test requiring OpenSSL headers unavailable in environment.","timestamp":1773811049573,"segment":0}
+{"type":"config","name":"Arkama core download loop performance + correctness","metricName":"download_e2e_ms","metricUnit":"ms","bestDirection":"lower"}
