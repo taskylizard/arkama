@@ -675,6 +675,8 @@ impl DownloadPlan {
             }
         }
 
+        ensure_parent_dir(&output)?;
+
         let state = DownloadState {
             url: self.url.to_string(),
             output: self.output.clone(),
@@ -1180,7 +1182,6 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
             return Err(eyre::eyre!(RangeUnsupported));
         }
 
-        ensure_parent_dir(&output)?;
         let file = AsyncOpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1312,6 +1313,7 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
     } = context;
     let mut attempts = 0u32;
     let mut offset = start;
+    ensure_parent_dir(&output)?;
     loop {
         let stop_signal = *stop_rx.borrow();
         if stop_signal != StopSignal::None {
@@ -1351,7 +1353,6 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
             continue;
         }
 
-        ensure_parent_dir(&output)?;
         let file = AsyncOpenOptions::new()
             .create(true)
             .truncate(false)
