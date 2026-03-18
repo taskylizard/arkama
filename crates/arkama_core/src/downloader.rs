@@ -321,7 +321,7 @@ struct DownloadPlanConfig {
 }
 
 const EXPERIMENTAL_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
-const STATE_SYNC_BATCH_BYTES: u64 = 64 * 1024;
+const STATE_SYNC_BATCH_BYTES: u64 = 96 * 1024;
 
 #[derive(Debug)]
 struct RangeUnsupported;
