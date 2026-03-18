@@ -121,20 +121,24 @@ async fn download_segmented_large_payload() {
     let (addr, server_handle) = spawn_server(data.clone()).await;
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let path = temp_dir.path().join("large.bin");
-    let req = DownloadRequest {
-        url: format!("http://{addr}/large.bin"),
-        output: Some(path.clone()),
-        output_dir: None,
-        connections: 8,
-        user_agent: None,
-        limit: None,
-        experimental_entropy: false,
-    };
+    let mut run = 0usize;
+    while run < 6 {
+        let path = temp_dir.path().join(format!("large-{run}.bin"));
+        let req = DownloadRequest {
+            url: format!("http://{addr}/large.bin"),
+            output: Some(path),
+            output_dir: None,
+            connections: 8,
+            user_agent: None,
+            limit: None,
+            experimental_entropy: false,
+        };
 
-    let summary = download(req).await.expect("segmented download");
-    assert_eq!(summary.total_bytes, data.len() as u64);
-    assert_eq!(summary.downloaded_bytes, data.len() as u64);
+        let summary = download(req).await.expect("segmented download");
+        assert_eq!(summary.total_bytes, data.len() as u64);
+        assert_eq!(summary.downloaded_bytes, data.len() as u64);
+        run += 1;
+    }
 
     server_handle.abort();
     let _ = server_handle.await;
