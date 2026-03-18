@@ -321,6 +321,7 @@ struct DownloadPlanConfig {
 }
 
 const EXPERIMENTAL_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
+const STATE_SYNC_BATCH_BYTES: u64 = 84 * 1024;
 
 #[derive(Debug)]
 struct RangeUnsupported;
@@ -674,6 +675,8 @@ impl DownloadPlan {
             }
         }
 
+        ensure_parent_dir(&output)?;
+
         let state = DownloadState {
             url: self.url.to_string(),
             output: self.output.clone(),
@@ -1023,7 +1026,6 @@ fn prepare_output(path: &Path, total: u64) -> Result<()> {
         .create(true)
         .truncate(false)
         .write(true)
-        .read(true)
         .open(path)
         .with_context(|| format!("failed to open output file {path:?}"))?;
     file.set_len(total)
@@ -1068,6 +1070,13 @@ async fn save_state(output: &Path, state: &TokioMutex<DownloadState>) -> Result<
 
 async fn update_state(state: &TokioMutex<DownloadState>, updated: &Segment) -> Result<()> {
     let mut state = state.lock().await;
+    if let Some(segment) = state.segments.get_mut(updated.id)
+        && segment.id == updated.id
+    {
+        segment.downloaded = updated.downloaded;
+        return Ok(());
+    }
+
     let mut index = 0usize;
     while index < state.segments.len() {
         if state.segments[index].id == updated.id {
@@ -1086,6 +1095,7 @@ async fn periodic_save(
     interval: Duration,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
@@ -1172,12 +1182,10 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
             return Err(eyre::eyre!(RangeUnsupported));
         }
 
-        ensure_parent_dir(&output)?;
         let file = AsyncOpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .read(true)
             .open(&output)
             .await
             .with_context(|| format!("failed to open output file {output:?}"))?;
@@ -1186,11 +1194,15 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
         let mut stream = response.bytes_stream();
 
         let mut recycle = false;
+        let mut pending_state_sync = 0u64;
         loop {
             tokio::select! {
                 _ = stop_rx.changed() => {
                     let stop_signal = *stop_rx.borrow();
                     if stop_signal != StopSignal::None {
+                        if pending_state_sync > 0 {
+                            update_state(&state, &segment).await?;
+                        }
                         return Err(eyre::Report::new(stop_signal));
                     }
                 }
@@ -1205,6 +1217,7 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                             let len = bytes.len() as u64;
                             offset += len;
                             segment.downloaded += len;
+                            pending_state_sync += len;
                             let downloaded = total_downloaded.fetch_add(len, Ordering::Relaxed) + len;
                             send_event(
                                 &events,
@@ -1213,7 +1226,10 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                                     total_bytes: total_size,
                                 },
                             );
-                            update_state(&state, &segment).await?;
+                            if pending_state_sync >= STATE_SYNC_BATCH_BYTES {
+                                update_state(&state, &segment).await?;
+                                pending_state_sync = 0;
+                            }
                             if let Some(slow_tracker) = slow_tracker.as_ref() {
                                 let elapsed = started.elapsed();
                                 if elapsed > Duration::from_secs(1) {
@@ -1222,6 +1238,9 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                                         tracker.should_recycle(elapsed)
                                     };
                                     if should_recycle {
+                                        if pending_state_sync > 0 {
+                                            update_state(&state, &segment).await?;
+                                        }
                                         recycle = true;
                                         break;
                                     }
@@ -1229,6 +1248,9 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                             }
                         }
                         Some(Err(err)) => {
+                            if pending_state_sync > 0 {
+                                update_state(&state, &segment).await?;
+                            }
                             attempts += 1;
                             if attempts > 5 {
                                 return Err(eyre::eyre!("segment download failed: {err}"));
@@ -1239,6 +1261,9 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                             break;
                         }
                         None => {
+                            if pending_state_sync > 0 {
+                                update_state(&state, &segment).await?;
+                            }
                             let expected = segment.end.saturating_sub(segment.start) + 1;
                             if segment.downloaded < expected {
                                 attempts += 1;
@@ -1287,6 +1312,7 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
     } = context;
     let mut attempts = 0u32;
     let mut offset = start;
+    ensure_parent_dir(&output)?;
     loop {
         let stop_signal = *stop_rx.borrow();
         if stop_signal != StopSignal::None {
@@ -1326,12 +1352,10 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
             continue;
         }
 
-        ensure_parent_dir(&output)?;
         let file = AsyncOpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .read(true)
             .open(&output)
             .await
             .with_context(|| format!("failed to open output file {output:?}"))?;
