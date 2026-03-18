@@ -2,7 +2,7 @@
 set -euo pipefail
 
 TEST_NAME="download_segmented_large_payload"
-RUNS=3
+RUNS=5
 
 # Build test binary outside timed region.
 cargo test -p arkama_core --test download_e2e "$TEST_NAME" --no-run --quiet
@@ -12,6 +12,9 @@ if [[ -z "${TEST_BIN}" ]]; then
   echo "failed to locate download_e2e test binary" >&2
   exit 1
 fi
+
+# Warm-up run to stabilize runtime effects.
+"$TEST_BIN" --exact "$TEST_NAME" > /dev/null
 
 measurements=()
 for _ in $(seq 1 "$RUNS"); do
