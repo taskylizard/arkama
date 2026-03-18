@@ -1096,6 +1096,7 @@ async fn periodic_save(
     interval: Duration,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
