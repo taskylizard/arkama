@@ -1026,7 +1026,6 @@ fn prepare_output(path: &Path, total: u64) -> Result<()> {
         .create(true)
         .truncate(false)
         .write(true)
-        .read(true)
         .open(path)
         .with_context(|| format!("failed to open output file {path:?}"))?;
     file.set_len(total)
@@ -1187,7 +1186,6 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
             .create(true)
             .truncate(false)
             .write(true)
-            .read(true)
             .open(&output)
             .await
             .with_context(|| format!("failed to open output file {output:?}"))?;
@@ -1358,7 +1356,6 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
             .create(true)
             .truncate(false)
             .write(true)
-            .read(true)
             .open(&output)
             .await
             .with_context(|| format!("failed to open output file {output:?}"))?;
