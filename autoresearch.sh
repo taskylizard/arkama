@@ -4,13 +4,19 @@ set -euo pipefail
 TEST_NAME="download_segmented_large_payload"
 RUNS=3
 
-# Fast pre-check/build step outside timed region.
+# Build test binary outside timed region.
 cargo test -p arkama_core --test download_e2e "$TEST_NAME" --no-run --quiet
+
+TEST_BIN=$(find "target/debug/deps" -maxdepth 1 -type f -name "download_e2e-*" -perm -111 -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+if [[ -z "${TEST_BIN}" ]]; then
+  echo "failed to locate download_e2e test binary" >&2
+  exit 1
+fi
 
 measurements=()
 for _ in $(seq 1 "$RUNS"); do
   start_ns=$(date +%s%N)
-  cargo test -p arkama_core --test download_e2e "$TEST_NAME" -- --exact
+  "$TEST_BIN" --exact "$TEST_NAME"
   end_ns=$(date +%s%N)
   elapsed_ms=$(((end_ns - start_ns) / 1000000))
   measurements+=("$elapsed_ms")

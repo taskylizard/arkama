@@ -8,7 +8,7 @@ Optimize download runtime in `arkama_core` while preserving behavior correctness
 - **Secondary**: `run_experiment_duration_s`, `cargo_check_pass`, `cargo_test_pass`, `cargo_clippy_fix_pass`, `cargo_fmt_pass`
 
 ## How to Run
-`./autoresearch.sh` — runs `download_segmented_large_payload` 3 times and prints median `METRIC download_e2e_ms=<number>`.
+`./autoresearch.sh` — builds `download_e2e` test binary, runs `download_segmented_large_payload` 3 times directly via the test binary, prints median `METRIC download_e2e_ms=<number>`.
 
 ## Files in Scope
 - `crates/arkama_core/src/downloader.rs` — hot download loops, segment scheduling, resume state updates.
