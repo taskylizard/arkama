@@ -1,7 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -73,7 +73,9 @@ pub(crate) struct FlakyServer {
 
 impl FlakyServer {
     pub(crate) async fn spawn(config: FlakyServerConfig) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
         let state = Arc::new(SharedState {
             config,
@@ -94,7 +96,11 @@ impl FlakyServer {
             }
         });
 
-        Self { addr, state, handle }
+        Self {
+            addr,
+            state,
+            handle,
+        }
     }
 
     pub(crate) fn url(&self) -> String {
@@ -276,7 +282,10 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>>
             break;
         }
         if buffer.len() > 64 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request too large",
+            ));
         }
     }
 
@@ -287,7 +296,10 @@ fn parse_request(buffer: &[u8]) -> io::Result<HttpRequest> {
     let request = String::from_utf8_lossy(buffer);
     let mut lines = request.split("\r\n");
     let Some(line) = lines.next() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing request line"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing request line",
+        ));
     };
     let mut parts = line.split_whitespace();
     let Some(method) = parts.next() else {
@@ -296,7 +308,12 @@ fn parse_request(buffer: &[u8]) -> io::Result<HttpRequest> {
     let method = match method {
         "HEAD" => HttpMethod::Head,
         "GET" => HttpMethod::Get,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported method")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported method",
+            ));
+        }
     };
 
     let mut range = None;
@@ -316,7 +333,11 @@ fn parse_range(value: &str) -> Option<ByteRange> {
     let value = value.strip_prefix("bytes=")?;
     let (start, end) = value.split_once('-')?;
     let start = start.parse().ok()?;
-    let end = if end.is_empty() { None } else { end.parse().ok() };
+    let end = if end.is_empty() {
+        None
+    } else {
+        end.parse().ok()
+    };
     Some(ByteRange { start, end })
 }
 
