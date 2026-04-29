@@ -4,10 +4,30 @@ use directories::{ProjectDirs, UserDirs};
 use eyre::{Context, ContextCompat, Result};
 use tracing::info;
 
+pub fn data_dir() -> Result<PathBuf> {
+    match std::env::var("ARKAMA_DATA_DIR") {
+        Ok(path) => Ok(PathBuf::from(path)),
+        Err(std::env::VarError::NotPresent) => {
+            let dirs = ProjectDirs::from("com", "arkama", "arkama")
+                .context("failed to resolve app dirs")?;
+            Ok(dirs.data_dir().to_path_buf())
+        }
+        Err(err) => Err(err).context("failed to read ARKAMA_DATA_DIR"),
+    }
+}
+
 pub fn db_path() -> Result<PathBuf> {
-    let dirs =
-        ProjectDirs::from("com", "arkama", "arkama").context("failed to resolve app dirs")?;
-    let path = dirs.data_dir().join("arkama.sqlite");
+    let path = data_dir()?.join("arkama.sqlite");
+    Ok(path)
+}
+
+pub fn daemon_addr_path() -> Result<PathBuf> {
+    let path = data_dir()?.join("daemon.addr");
+    Ok(path)
+}
+
+pub fn daemon_log_path() -> Result<PathBuf> {
+    let path = data_dir()?.join("daemon.log");
     Ok(path)
 }
 

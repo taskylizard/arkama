@@ -10,16 +10,57 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::DownloadArgs;
+use crate::daemon;
 use crate::progress;
 use crate::util::{format_duration, format_speed};
 
 pub async fn run(args: DownloadArgs) -> Result<()> {
     let output_mode = OutputMode::from_args(&args);
     init_tracing(output_mode);
+
+    if args.daemon {
+        return queue_args(args, output_mode).await;
+    }
+
     run_args(args, output_mode).await
 }
 
 async fn run_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
+    let yes = args.yes;
+    if yes {
+        warn!("--yes is currently a no-op");
+    }
+
+    let db = Db::open()?;
+    let requests = resolve_requests(&db, args)?;
+
+    for request in requests {
+        let url = request.url.clone();
+        run_single(&db, request, output_mode, url).await?;
+    }
+
+    Ok(())
+}
+
+async fn queue_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
+    let yes = args.yes;
+    if yes {
+        warn!("--yes is currently a no-op");
+    }
+
+    let db = Db::open()?;
+    let requests = resolve_requests(&db, args)?;
+
+    for request in requests {
+        let url = request.url.clone();
+        let id = daemon::enqueue_download(request).await?;
+        emit_queued(output_mode, id, &url)?;
+    }
+
+    Ok(())
+}
+
+fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>> {
     let DownloadArgs {
         url,
         links_file,
@@ -28,17 +69,13 @@ async fn run_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
         user_agent,
         limit,
         experimental_entropy,
+        daemon: _,
         silent: _,
         json: _,
-        yes,
+        yes: _,
     } = args;
 
-    if yes {
-        warn!("--yes is currently a no-op");
-    }
-
-    let db = Db::open()?;
-    let output_dir = resolve_output_dir(&db)?;
+    let output_dir = resolve_output_dir(db)?;
     let connections = resolve_connections(connections, db.get_setting("connections")?)?;
     let limit = resolve_speed_limit(limit, db.get_setting("speed_limit")?)?;
 
@@ -46,16 +83,15 @@ async fn run_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
         let Some(url) = url else {
             return Err(eyre::eyre!("missing url"));
         };
-        let request = DownloadRequest {
-            url: url.clone(),
+        return Ok(vec![DownloadRequest {
+            url,
             output,
             output_dir: Some(output_dir),
             connections,
             user_agent,
             limit,
             experimental_entropy,
-        };
-        return run_single(&db, request, output_mode, url).await;
+        }]);
     };
 
     if output.is_some() {
@@ -67,20 +103,20 @@ async fn run_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
         return Err(eyre::eyre!("no links found in {links_file:?}"));
     }
 
-    for link in links {
-        let request = DownloadRequest {
-            url: link.clone(),
+    let mut requests = Vec::new();
+    for url in links {
+        requests.push(DownloadRequest {
+            url,
             output: None,
             output_dir: Some(output_dir.clone()),
             connections,
             user_agent: user_agent.clone(),
             limit,
             experimental_entropy,
-        };
-        run_single(&db, request, output_mode, link).await?;
+        });
     }
 
-    Ok(())
+    Ok(requests)
 }
 
 fn resolve_output_dir(db: &Db) -> Result<PathBuf> {
@@ -371,6 +407,21 @@ fn print_summary(summary: &DownloadSummary) -> Result<()> {
 fn emit_json(value: serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
+}
+
+fn emit_queued(output_mode: OutputMode, id: i64, url: &str) -> Result<()> {
+    match output_mode {
+        OutputMode::Default => {
+            println!("queued job {id} for {url}");
+            Ok(())
+        }
+        OutputMode::Silent => Ok(()),
+        OutputMode::Json => emit_json(json!({
+            "event": "queued",
+            "job_id": id,
+            "url": url,
+        })),
+    }
 }
 
 fn summary_json(event: &str, url: &str, summary: &DownloadSummary) -> serde_json::Value {

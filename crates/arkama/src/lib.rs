@@ -1,13 +1,14 @@
 mod cli;
 mod completions;
 mod config;
+mod daemon;
 mod download;
 mod gui;
 mod history;
 mod progress;
 mod util;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 use tokio::task;
 
@@ -25,6 +26,9 @@ struct CombinedArgs {
 enum CombinedCommand {
     #[command(about = "Download a file from a URL.")]
     Download(cli::DownloadArgs),
+
+    #[command(about = "Run or manage the background daemon.")]
+    Daemon(DaemonCliArgs),
 
     #[command(about = "Launch the graphical user interface.")]
     Gui,
@@ -59,6 +63,9 @@ enum CliCommand {
     #[command(about = "Download a file from a URL.")]
     Download(cli::DownloadArgs),
 
+    #[command(about = "Run or manage the background daemon.")]
+    Daemon(DaemonCliArgs),
+
     #[command(about = "Show download history.")]
     History(history::HistoryArgs),
 
@@ -80,6 +87,12 @@ struct GuiArgs {
     reset_db: bool,
 }
 
+#[derive(Args, Debug)]
+struct DaemonCliArgs {
+    #[command(subcommand)]
+    command: daemon::DaemonCommand,
+}
+
 pub async fn run_combined() -> Result<()> {
     let args = CombinedArgs::parse();
 
@@ -89,6 +102,7 @@ pub async fn run_combined() -> Result<()> {
 
     match args.command {
         Some(CombinedCommand::Download(download_args)) => download::run(download_args).await,
+        Some(CombinedCommand::Daemon(daemon_args)) => daemon::run(daemon_args.command).await,
         Some(CombinedCommand::Gui) => run_gui().await,
         Some(CombinedCommand::History(history_args)) => history::run(history_args),
         Some(CombinedCommand::Config(config_args)) => config::run(config_args),
@@ -108,6 +122,7 @@ pub async fn run_cli() -> Result<()> {
 
     match args.command {
         CliCommand::Download(download_args) => download::run(download_args).await,
+        CliCommand::Daemon(daemon_args) => daemon::run(daemon_args.command).await,
         CliCommand::History(history_args) => history::run(history_args),
         CliCommand::Config(config_args) => config::run(config_args),
         CliCommand::Completions(completions_args) => {

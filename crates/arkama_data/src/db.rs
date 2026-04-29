@@ -67,11 +67,27 @@ impl Db {
     }
 
     pub fn insert_download(&self, url: &str, output_path: &Path) -> Result<i64> {
+        self.insert_download_with_status(url, output_path, "running")
+    }
+
+    pub fn insert_download_with_status(
+        &self,
+        url: &str,
+        output_path: &Path,
+        status: &str,
+    ) -> Result<i64> {
         let now = now_ts();
         self.conn.execute(
             "INSERT INTO downloads (url, output_path, status, total_bytes, downloaded_bytes, started_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![url, output_path.display().to_string(), "running", Option::<i64>::None, 0i64, now],
+            params![
+                url,
+                output_path.display().to_string(),
+                status,
+                Option::<i64>::None,
+                0i64,
+                now,
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -85,8 +101,15 @@ impl Db {
     ) -> Result<()> {
         let total_bytes = total_bytes.map(|value| value as i64);
         self.conn.execute(
-            "UPDATE downloads SET output_path = ?1, total_bytes = ?2, downloaded_bytes = ?3 WHERE id = ?4",
-            params![output_path.display().to_string(), total_bytes, downloaded_bytes as i64, id],
+            "UPDATE downloads
+             SET output_path = ?1, status = 'running', total_bytes = ?2, downloaded_bytes = ?3, finished_at = NULL
+             WHERE id = ?4",
+            params![
+                output_path.display().to_string(),
+                total_bytes,
+                downloaded_bytes as i64,
+                id,
+            ],
         )?;
         Ok(())
     }
@@ -153,6 +176,14 @@ impl Db {
     pub fn normalize_running_to_paused(&self) -> Result<()> {
         self.conn.execute(
             "UPDATE downloads SET status = 'paused' WHERE status = 'running'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn normalize_queued_to_paused(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads SET status = 'paused' WHERE status = 'queued'",
             [],
         )?;
         Ok(())

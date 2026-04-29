@@ -80,6 +80,8 @@ fn status_cell(status: &str) -> Cell {
         Color::Red
     } else if status == "finished" {
         Color::Green
+    } else if status == "queued" {
+        Color::Cyan
     } else if status == "running" {
         Color::Blue
     } else if status == "paused" {

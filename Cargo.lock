@@ -270,6 +270,7 @@ dependencies = [
  "open",
  "owo-colors",
  "rfd",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

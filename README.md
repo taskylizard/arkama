@@ -10,6 +10,8 @@ Fast, practical download manager. Ships as `arkama-cli`, `arkama-gui`, and the c
 arkama-cli download <url>
 arkama-cli download <url> -o ./file.bin
 arkama-cli download <url> --connections 8
+arkama-cli daemon start
+arkama-cli download <url> --daemon
 ```
 
 ## ✨ Features
@@ -27,6 +29,7 @@ Both CLI and the desktop apps are kept upto date on feature parity.
 - Optional global speed limit.
 - Experimental connection entropy mode for LACP/ECMP environments.
 - Download history backed by SQLite.
+- Background daemon with local TCP control.
 - Search across past downloads.
 - Configurable download folder (persisted in app settings).
 - Live progress and status in the UI.
@@ -62,8 +65,18 @@ Download a file from a URL.
 - `--user-agent <UA>`: override HTTP User-Agent.
 - `--limit <BYTES_PER_SEC>`: global speed limit (defaults to config if unset; ex: `2MB`, `500KB`).
 - `--experimental-entropy`: experimental; disables idle pooling, uses 4MB segments, and recycles slow segment connections.
+- `--daemon`: enqueue the download on the local Arkama daemon.
 - `--silent`: suppress progress and summary output.
 - `--json`: emit JSON events to stdout for automation.
+
+### `arkama-cli daemon <COMMAND>`
+
+Manage the background daemon.
+
+- `arkama-cli daemon start`: launch the daemon in the background.
+- `arkama-cli daemon run`: run the daemon in the foreground.
+- `arkama-cli daemon status`: show daemon status.
+- `arkama-cli daemon stop`: stop the daemon.
 
 ### `arkama-cli history [OPTIONS]`
 
@@ -139,6 +152,8 @@ arkama-cli download https://example.com/file --connections 8
 arkama-cli download https://example.com/file --limit 2MB
 arkama-cli download --links-file ./links.txt
 arkama-cli download https://example.com/file --experimental-entropy
+arkama-cli daemon start
+arkama-cli download https://example.com/file --daemon
 arkama-cli download https://example.com/file --silent
 arkama-cli download https://example.com/file --json
 

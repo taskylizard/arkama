@@ -52,6 +52,12 @@ pub struct DownloadArgs {
     pub experimental_entropy: bool,
 
     #[arg(
+        long = "daemon",
+        help = "Submit the download to the local Arkama daemon instead of downloading in the current process."
+    )]
+    pub daemon: bool,
+
+    #[arg(
         long = "silent",
         conflicts_with = "json",
         help = "Suppress progress and summary output."

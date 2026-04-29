@@ -26,6 +26,7 @@ eyre.workspace = true
 indicatif.workspace = true
 notify-rust = "4"
 rfd = "0.14"
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
