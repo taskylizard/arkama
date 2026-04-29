@@ -32,6 +32,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"
+comfy-table = "7.2.2"
 console = "0.15"
 dialoguer = "0.11"
 open = "5"

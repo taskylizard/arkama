@@ -1,7 +1,9 @@
 use arkama_data::{Db, DownloadRecord};
 use clap::Args;
+use comfy_table::{
+    Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL,
+};
 use eyre::Result;
-use std::fmt::Write as _;
 
 use crate::util::history_progress_text;
 
@@ -38,53 +40,55 @@ pub fn run(args: HistoryArgs) -> Result<()> {
 }
 
 fn render_table(records: &[DownloadRecord]) -> String {
-    let headers = ["ID", "STATUS", "PROGRESS", "OUTPUT", "URL"];
-    let mut widths = headers.map(str::len);
-    let mut rows = Vec::new();
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header([
+            header_cell("ID"),
+            header_cell("STATUS"),
+            header_cell("PROGRESS"),
+            header_cell("OUTPUT"),
+            header_cell("URL"),
+        ]);
 
     for record in records {
-        let row = [
-            record.id.to_string(),
-            record.status.clone(),
-            history_progress_text(record.downloaded_bytes, record.total_bytes),
-            record.output_path.clone(),
-            record.url.clone(),
-        ];
-        for (index, value) in row.iter().enumerate() {
-            widths[index] = widths[index].max(value.chars().count());
-        }
-        rows.push(row);
+        table.add_row([
+            Cell::new(record.id).set_alignment(CellAlignment::Right),
+            status_cell(&record.status),
+            Cell::new(history_progress_text(
+                record.downloaded_bytes,
+                record.total_bytes,
+            ))
+            .set_alignment(CellAlignment::Right),
+            Cell::new(&record.output_path),
+            Cell::new(&record.url),
+        ]);
     }
 
-    let mut table = String::new();
-    write_row(&mut table, &headers, &widths);
-    write_separator(&mut table, &widths);
-    for row in rows {
-        write_row(&mut table, &row, &widths);
-    }
-
-    table
+    table.to_string()
 }
 
-fn write_row<const N: usize>(table: &mut String, row: &[impl AsRef<str>; N], widths: &[usize; N]) {
-    for (index, value) in row.iter().enumerate() {
-        let value = value.as_ref();
-        let _ = write!(table, "{value:<width$}", width = widths[index]);
-        if index + 1 < N {
-            table.push_str("  ");
-        }
-    }
-    table.push('\n');
+fn header_cell(label: &str) -> Cell {
+    Cell::new(label)
+        .fg(Color::Cyan)
+        .add_attribute(Attribute::Bold)
 }
 
-fn write_separator<const N: usize>(table: &mut String, widths: &[usize; N]) {
-    for (index, width) in widths.iter().enumerate() {
-        for _ in 0..*width {
-            table.push('-');
-        }
-        if index + 1 < N {
-            table.push_str("  ");
-        }
-    }
-    table.push('\n');
+fn status_cell(status: &str) -> Cell {
+    let color = if status.starts_with("failed") {
+        Color::Red
+    } else if status == "finished" {
+        Color::Green
+    } else if status == "running" {
+        Color::Blue
+    } else if status == "paused" {
+        Color::Yellow
+    } else if status == "cancelled" {
+        Color::DarkYellow
+    } else {
+        Color::White
+    };
+
+    Cell::new(status).fg(color)
 }
