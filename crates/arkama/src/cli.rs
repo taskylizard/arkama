@@ -30,15 +30,19 @@ pub struct DownloadArgs {
 
     #[arg(
         long = "connections",
-        default_value_t = 4,
-        help = "Concurrent connections for segmented downloads."
+        help = "Concurrent connections for segmented downloads (defaults to config, otherwise 4)."
     )]
-    pub connections: usize,
+    pub connections: Option<usize>,
 
     #[arg(long = "user-agent", help = "Override HTTP User-Agent.")]
     pub user_agent: Option<String>,
 
-    #[arg(long = "limit", value_name = "BYTES_PER_SEC", value_parser = parse_rate, help = "Global download speed limit (ex: 2MB, 500KB).")]
+    #[arg(
+        long = "limit",
+        value_name = "BYTES_PER_SEC",
+        value_parser = parse_rate,
+        help = "Global download speed limit (defaults to config if unset; ex: 2MB, 500KB)."
+    )]
     pub limit: Option<u64>,
 
     #[arg(

@@ -38,6 +38,8 @@ CLI and GUI share the same SQLite database for settings and download history:
 ```bash
 # Set download folder (used by both CLI and GUI)
 arkama config set download_dir ~/Downloads
+arkama config set connections 8
+arkama config set speed_limit 2MB
 
 # View current config
 arkama config show
@@ -56,9 +58,9 @@ Download a file from a URL.
 
 - `-o, --output <PATH>`: output file path.
 - `--links-file <PATH>`: text file with one URL per line (downloads run sequentially).
-- `--connections <N>`: concurrent connections for segmented downloads (default 4).
+- `--connections <N>`: concurrent connections for segmented downloads (defaults to config, otherwise `4`).
 - `--user-agent <UA>`: override HTTP User-Agent.
-- `--limit <BYTES_PER_SEC>`: global speed limit (ex: `2MB`, `500KB`).
+- `--limit <BYTES_PER_SEC>`: global speed limit (defaults to config if unset; ex: `2MB`, `500KB`).
 - `--experimental-entropy`: experimental; disables idle pooling, uses 4MB segments, and recycles slow segment connections.
 - `--silent`: suppress progress and summary output.
 - `--json`: emit JSON events to stdout for automation.
@@ -77,6 +79,13 @@ View or modify configuration.
 - `arkama config show`: show all settings.
 - `arkama config get <KEY>`: get a setting value.
 - `arkama config set <KEY> <VALUE>`: set a setting value.
+
+Common keys:
+
+- `download_dir`
+- `connections`
+- `max_concurrent`
+- `speed_limit`
 
 ### `arkama gui`
 

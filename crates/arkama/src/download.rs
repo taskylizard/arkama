@@ -39,6 +39,8 @@ async fn run_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
 
     let db = Db::open()?;
     let output_dir = resolve_output_dir(&db)?;
+    let connections = resolve_connections(connections, db.get_setting("connections")?)?;
+    let limit = resolve_speed_limit(limit, db.get_setting("speed_limit")?)?;
 
     let Some(links_file) = links_file else {
         let Some(url) = url else {
@@ -87,6 +89,37 @@ fn resolve_output_dir(db: &Db) -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(default_download_dir);
     Ok(dir)
+}
+
+fn resolve_connections(connections: Option<usize>, configured: Option<String>) -> Result<usize> {
+    let Some(connections) = connections else {
+        let connections = match configured {
+            Some(connections) => connections
+                .parse()
+                .with_context(|| format!("invalid connections setting: {connections}"))?,
+            None => 4,
+        };
+        return Ok(connections);
+    };
+
+    Ok(connections)
+}
+
+fn resolve_speed_limit(limit: Option<u64>, configured: Option<String>) -> Result<Option<u64>> {
+    let Some(limit) = limit else {
+        let Some(limit) = configured else {
+            return Ok(None);
+        };
+        if limit.is_empty() {
+            return Ok(None);
+        }
+
+        let limit = bytefmt::parse(&limit)
+            .map_err(|err| eyre::eyre!("invalid speed_limit setting: {limit}: {err}"))?;
+        return Ok(Some(limit));
+    };
+
+    Ok(Some(limit))
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -393,4 +426,37 @@ fn format_duration(duration: Duration) -> String {
     let hours = minutes / 60;
     let rem_minutes = minutes % 60;
     format!("{hours}h{rem_minutes:02}m{rem_secs:02}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_connections, resolve_speed_limit};
+
+    #[test]
+    fn test_resolve_connections_uses_config_when_flag_missing() {
+        let connections = resolve_connections(None, Some("8".to_string())).unwrap();
+
+        assert_eq!(connections, 8);
+    }
+
+    #[test]
+    fn test_resolve_connections_prefers_flag_over_config() {
+        let connections = resolve_connections(Some(6), Some("8".to_string())).unwrap();
+
+        assert_eq!(connections, 6);
+    }
+
+    #[test]
+    fn test_resolve_speed_limit_uses_config_when_flag_missing() {
+        let limit = resolve_speed_limit(None, Some("2MB".to_string())).unwrap();
+
+        assert_eq!(limit, Some(2_000_000));
+    }
+
+    #[test]
+    fn test_resolve_speed_limit_prefers_flag_over_config() {
+        let limit = resolve_speed_limit(Some(512_000), Some("2MB".to_string())).unwrap();
+
+        assert_eq!(limit, Some(512_000));
+    }
 }
