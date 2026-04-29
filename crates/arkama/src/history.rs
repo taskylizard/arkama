@@ -1,8 +1,9 @@
 use arkama_data::{Db, DownloadRecord};
 use clap::Args;
 use eyre::Result;
+use std::fmt::Write as _;
 
-use crate::util::format_bytes;
+use crate::util::history_progress_text;
 
 #[derive(Args, Debug)]
 pub struct HistoryArgs {
@@ -31,25 +32,59 @@ pub fn run(args: HistoryArgs) -> Result<()> {
         return Ok(());
     }
 
-    for record in records {
-        print_record(&record);
-    }
+    println!("{}", render_table(&records));
 
     Ok(())
 }
 
-fn print_record(record: &DownloadRecord) {
-    let progress = match record.total_bytes {
-        Some(total) => format!(
-            "{}/{}",
-            format_bytes(record.downloaded_bytes),
-            format_bytes(total)
-        ),
-        None => format_bytes(record.downloaded_bytes),
-    };
+fn render_table(records: &[DownloadRecord]) -> String {
+    let headers = ["ID", "STATUS", "PROGRESS", "OUTPUT", "URL"];
+    let mut widths = headers.map(str::len);
+    let mut rows = Vec::new();
 
-    println!(
-        "[{}] {} -> {} ({})",
-        record.status, record.url, record.output_path, progress
-    );
+    for record in records {
+        let row = [
+            record.id.to_string(),
+            record.status.clone(),
+            history_progress_text(record.downloaded_bytes, record.total_bytes),
+            record.output_path.clone(),
+            record.url.clone(),
+        ];
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(value.chars().count());
+        }
+        rows.push(row);
+    }
+
+    let mut table = String::new();
+    write_row(&mut table, &headers, &widths);
+    write_separator(&mut table, &widths);
+    for row in rows {
+        write_row(&mut table, &row, &widths);
+    }
+
+    table
+}
+
+fn write_row<const N: usize>(table: &mut String, row: &[impl AsRef<str>; N], widths: &[usize; N]) {
+    for (index, value) in row.iter().enumerate() {
+        let value = value.as_ref();
+        let _ = write!(table, "{value:<width$}", width = widths[index]);
+        if index + 1 < N {
+            table.push_str("  ");
+        }
+    }
+    table.push('\n');
+}
+
+fn write_separator<const N: usize>(table: &mut String, widths: &[usize; N]) {
+    for (index, width) in widths.iter().enumerate() {
+        for _ in 0..*width {
+            table.push('-');
+        }
+        if index + 1 < N {
+            table.push_str("  ");
+        }
+    }
+    table.push('\n');
 }

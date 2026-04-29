@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub fn active_label(output: &Path) -> String {
     if output.as_os_str().is_empty() {
@@ -40,6 +40,40 @@ pub fn history_progress_text(downloaded_bytes: i64, total_bytes: Option<i64>) ->
     }
 }
 
+pub fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs == 0 {
+        let millis = duration.subsec_millis();
+        if millis == 0 {
+            return "0s".to_string();
+        }
+        return format!("{millis}ms");
+    }
+
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+
+    let units = [(days, "d"), (hours, "h"), (minutes, "m"), (seconds, "s")];
+    let mut parts = Vec::new();
+    for (value, suffix) in units {
+        if value == 0 {
+            continue;
+        }
+        parts.push(format!("{value}{suffix}"));
+        if parts.len() == 2 {
+            break;
+        }
+    }
+
+    parts.join(" ")
+}
+
+pub fn format_speed(bytes_per_sec: u64) -> String {
+    format!("{}/s", format_bytes(bytes_per_sec as i64))
+}
+
 pub fn should_persist_progress(
     last_update: &Instant,
     last_bytes: u64,
@@ -60,4 +94,23 @@ pub fn format_bytes(bytes: i64) -> String {
         unit_index += 1;
     }
     format!("{value:.1} {}", units[unit_index])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{format_duration, format_speed};
+
+    #[test]
+    fn test_format_duration_uses_compact_human_units() {
+        assert_eq!(format_duration(Duration::from_millis(850)), "850ms");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(format_duration(Duration::from_secs(7_381)), "2h 3m");
+    }
+
+    #[test]
+    fn test_format_speed_humanizes_bytes_per_second() {
+        assert_eq!(format_speed(1_536), "1.5 KB/s");
+    }
 }

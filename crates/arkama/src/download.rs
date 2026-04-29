@@ -5,13 +5,13 @@ use std::time::Duration;
 use arkama_core::{DownloadEvent, DownloadRequest, DownloadSummary, download, start_download};
 use arkama_data::{Db, default_download_dir};
 use eyre::{Context, Result};
-use indicatif::HumanBytes;
 use serde_json::json;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::DownloadArgs;
 use crate::progress;
+use crate::util::{format_duration, format_speed};
 
 pub async fn run(args: DownloadArgs) -> Result<()> {
     let output_mode = OutputMode::from_args(&args);
@@ -363,7 +363,7 @@ fn print_summary(summary: &DownloadSummary) -> Result<()> {
         "✓".green().bold(),
         file_name.bold(),
         duration.cyan(),
-        HumanBytes(speed).to_string().yellow()
+        format_speed(speed).yellow()
     );
     Ok(())
 }
@@ -405,27 +405,6 @@ fn average_speed(downloaded: u64, elapsed: Duration) -> u64 {
         }
     };
     downloaded.saturating_mul(1000) / elapsed_ms
-}
-
-fn format_duration(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    let millis = duration.subsec_millis();
-    if secs < 1 {
-        return format!("{millis}ms");
-    }
-    if secs < 60 {
-        return format!("{secs}.{millis:03}s");
-    }
-
-    let minutes = secs / 60;
-    let rem_secs = secs % 60;
-    if minutes < 60 {
-        return format!("{minutes}m{rem_secs:02}s");
-    }
-
-    let hours = minutes / 60;
-    let rem_minutes = minutes % 60;
-    format!("{hours}h{rem_minutes:02}m{rem_secs:02}s")
 }
 
 #[cfg(test)]
