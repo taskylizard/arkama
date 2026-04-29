@@ -7,6 +7,14 @@ edition.workspace = true
 name = "arkama"
 path = "src/main.rs"
 
+[[bin]]
+name = "arkama-cli"
+path = "src/bin/arkama-cli.rs"
+
+[[bin]]
+name = "arkama-gui"
+path = "src/bin/arkama-gui.rs"
+
 [dependencies]
 arkama_core = { path = "../arkama_core" }
 arkama_data = { path = "../arkama_data" }

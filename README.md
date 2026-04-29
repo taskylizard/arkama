@@ -2,14 +2,14 @@
 
 Very, _very_, _very_, work in progress, proceed with fire!
 
-Fast, practical download manager. Ships as a CLI and a desktop app.
+Fast, practical download manager. Ships as `arkama-cli`, `arkama-gui`, and the combined `arkama` binary.
 
 ## 🧭 Quick start (CLI)
 
 ```bash
-arkama download <url>
-arkama download <url> -o ./file.bin
-arkama download <url> --connections 8
+arkama-cli download <url>
+arkama-cli download <url> -o ./file.bin
+arkama-cli download <url> --connections 8
 ```
 
 ## ✨ Features
@@ -33,26 +33,26 @@ Both CLI and the desktop apps are kept upto date on feature parity.
 
 ## 🔄 Shared configuration
 
-CLI and GUI share the same SQLite database for settings and download history:
+All three binaries share the same SQLite database for settings and download history:
 
 ```bash
 # Set download folder (used by both CLI and GUI)
-arkama config set download_dir ~/Downloads
-arkama config set connections 8
-arkama config set speed_limit 2MB
+arkama-cli config set download_dir ~/Downloads
+arkama-cli config set connections 8
+arkama-cli config set speed_limit 2MB
 
 # View current config
-arkama config show
+arkama-cli config show
 
 # View download history
-arkama history
-arkama history -n 50
-arkama history -q "example.com"
+arkama-cli history
+arkama-cli history -n 50
+arkama-cli history -q "example.com"
 ```
 
 ## 🎛️ CLI commands
 
-### `arkama download [OPTIONS] [URL]`
+### `arkama-cli download [OPTIONS] [URL]`
 
 Download a file from a URL.
 
@@ -65,20 +65,20 @@ Download a file from a URL.
 - `--silent`: suppress progress and summary output.
 - `--json`: emit JSON events to stdout for automation.
 
-### `arkama history [OPTIONS]`
+### `arkama-cli history [OPTIONS]`
 
 Show download history.
 
 - `-n, --limit <N>`: number of records to show (default 20).
 - `-q, --query <QUERY>`: filter by URL, path, or status.
 
-### `arkama config <COMMAND>`
+### `arkama-cli config <COMMAND>`
 
 View or modify configuration.
 
-- `arkama config show`: show all settings.
-- `arkama config get <KEY>`: get a setting value.
-- `arkama config set <KEY> <VALUE>`: set a setting value.
+- `arkama-cli config show`: show all settings.
+- `arkama-cli config get <KEY>`: get a setting value.
+- `arkama-cli config set <KEY> <VALUE>`: set a setting value.
 
 Common keys:
 
@@ -87,9 +87,13 @@ Common keys:
 - `max_concurrent`
 - `speed_limit`
 
+### `arkama-gui`
+
+Launch the graphical user interface directly.
+
 ### `arkama gui`
 
-Launch the graphical user interface.
+Launch the graphical user interface through the combined binary.
 
 ### Global options
 
@@ -129,22 +133,25 @@ Should I use this? Nope.
 
 ```bash
 # Download files
-arkama download https://example.com/file
-arkama download https://example.com/file -o ./file.bin
-arkama download https://example.com/file --connections 8
-arkama download https://example.com/file --limit 2MB
-arkama download --links-file ./links.txt
-arkama download https://example.com/file --experimental-entropy
-arkama download https://example.com/file --silent
-arkama download https://example.com/file --json
+arkama-cli download https://example.com/file
+arkama-cli download https://example.com/file -o ./file.bin
+arkama-cli download https://example.com/file --connections 8
+arkama-cli download https://example.com/file --limit 2MB
+arkama-cli download --links-file ./links.txt
+arkama-cli download https://example.com/file --experimental-entropy
+arkama-cli download https://example.com/file --silent
+arkama-cli download https://example.com/file --json
 
 # Configuration and history
-arkama config show
-arkama config set download_dir ~/Downloads
-arkama history
-arkama history -n 10 -q "zip"
+arkama-cli config show
+arkama-cli config set download_dir ~/Downloads
+arkama-cli history
+arkama-cli history -n 10 -q "zip"
 
-# Launch GUI (default when no command given)
+# Launch GUI
+arkama-gui
 arkama gui
+
+# Launch GUI from the combined binary (default when no command given)
 arkama
 ```
