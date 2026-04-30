@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arkama_core::{DownloadRequest, DownloadSummary};
 use eyre::{Context, Result};
 use rusqlite::{Connection, params};
 
@@ -14,6 +15,10 @@ pub struct Db {
 impl Db {
     pub fn open() -> Result<Self> {
         let path = db_path()?;
+        Self::open_path(&path)
+    }
+
+    fn open_path(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create data dir {parent:?}"))?;
@@ -42,7 +47,28 @@ impl Db {
                 value TEXT NOT NULL
             );",
         )?;
+        self.migrate_downloads_table()?;
         Ok(())
+    }
+
+    fn migrate_downloads_table(&self) -> Result<()> {
+        if !self.downloads_column_exists("daemon_request")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN daemon_request TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn downloads_column_exists(&self, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(downloads)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -92,6 +118,44 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn insert_daemon_download(&self, request: &DownloadRequest) -> Result<i64> {
+        let now = now_ts();
+        let output_path = queued_output_path(request);
+        let url = request.url.clone();
+        let request =
+            serde_json::to_string(request).context("failed to serialize daemon request")?;
+        self.conn.execute(
+            "INSERT INTO downloads (
+                url,
+                output_path,
+                status,
+                total_bytes,
+                downloaded_bytes,
+                started_at,
+                daemon_request
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6)",
+            params![
+                url,
+                output_path.display().to_string(),
+                Option::<i64>::None,
+                0i64,
+                now,
+                request,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_daemon_request(&self, id: i64, request: &DownloadRequest) -> Result<()> {
+        let request =
+            serde_json::to_string(request).context("failed to serialize daemon request")?;
+        self.conn.execute(
+            "UPDATE downloads SET daemon_request = ?1 WHERE id = ?2",
+            params![request, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_download_started(
         &self,
         id: i64,
@@ -128,11 +192,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_download_finished(
-        &self,
-        id: i64,
-        summary: &arkama_core::DownloadSummary,
-    ) -> Result<()> {
+    pub fn update_download_finished(&self, id: i64, summary: &DownloadSummary) -> Result<()> {
         let finished_at = now_ts();
         self.conn.execute(
             "UPDATE downloads SET status = ?1, total_bytes = ?2, downloaded_bytes = ?3, finished_at = ?4 WHERE id = ?5",
@@ -167,6 +227,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn requeue_download(&self, id: i64, downloaded_bytes: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads SET status = 'queued', downloaded_bytes = ?1, finished_at = NULL WHERE id = ?2",
+            params![downloaded_bytes as i64, id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_download(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM downloads WHERE id = ?1", params![id])?;
@@ -175,7 +243,7 @@ impl Db {
 
     pub fn normalize_running_to_paused(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE downloads SET status = 'paused' WHERE status = 'running'",
+            "UPDATE downloads SET status = 'paused' WHERE status = 'running' AND daemon_request IS NULL",
             [],
         )?;
         Ok(())
@@ -183,10 +251,60 @@ impl Db {
 
     pub fn normalize_queued_to_paused(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE downloads SET status = 'paused' WHERE status = 'queued'",
+            "UPDATE downloads SET status = 'paused' WHERE status = 'queued' AND daemon_request IS NULL",
             [],
         )?;
         Ok(())
+    }
+
+    pub fn recover_daemon_downloads(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads
+             SET status = 'queued', finished_at = NULL
+             WHERE daemon_request IS NOT NULL AND (status = 'starting' OR status = 'running')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_next_daemon_download(&self) -> Result<Option<(i64, DownloadRequest)>> {
+        loop {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, daemon_request
+                 FROM downloads
+                 WHERE daemon_request IS NOT NULL AND status = 'queued'
+                 ORDER BY id ASC
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query([])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let id: i64 = row.get(0)?;
+            let request: String = row.get(1)?;
+
+            let claimed = self.conn.execute(
+                "UPDATE downloads SET status = 'starting', finished_at = NULL WHERE id = ?1 AND status = 'queued'",
+                params![id],
+            )?;
+            if claimed == 0 {
+                continue;
+            }
+
+            let request = serde_json::from_str(&request).with_context(|| {
+                format!("failed to deserialize daemon request for download {id}")
+            })?;
+            return Ok(Some((id, request)));
+        }
+    }
+
+    pub fn count_queued_daemon_downloads(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM downloads WHERE daemon_request IS NOT NULL AND status = 'queued'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     pub fn load_downloads(&self, query: &str) -> Result<Vec<DownloadRecord>> {
@@ -255,10 +373,155 @@ impl Db {
     }
 }
 
+fn queued_output_path(request: &DownloadRequest) -> &Path {
+    let Some(output) = request.output.as_deref() else {
+        return Path::new("");
+    };
+    output
+}
+
 fn now_ts() -> i64 {
     let now = SystemTime::now();
     let Ok(duration) = now.duration_since(UNIX_EPOCH) else {
         return 0;
     };
     duration.as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::Db;
+    use arkama_core::DownloadRequest;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    fn open_test_db() -> (TempDir, Db) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("arkama.sqlite");
+        let db = Db::open_path(&path).unwrap();
+        (temp_dir, db)
+    }
+
+    fn request(url: &str) -> DownloadRequest {
+        DownloadRequest {
+            url: url.to_string(),
+            output: None,
+            output_dir: Some(PathBuf::from("/tmp")),
+            connections: 4,
+            user_agent: None,
+            limit: None,
+            experimental_entropy: false,
+        }
+    }
+
+    fn status_for(db: &Db, id: i64) -> String {
+        let records = db.load_downloads("").unwrap();
+        for record in records {
+            if record.id == id {
+                return record.status;
+            }
+        }
+        panic!("missing record {id}");
+    }
+
+    #[test]
+    fn test_claim_next_daemon_download_returns_oldest_queued_job() {
+        let (_temp_dir, db) = open_test_db();
+        let first_id = db
+            .insert_daemon_download(&request("https://example.com/first"))
+            .unwrap();
+        let second_id = db
+            .insert_daemon_download(&request("https://example.com/second"))
+            .unwrap();
+
+        let claimed = db.claim_next_daemon_download().unwrap();
+        let Some((claimed_id, claimed_request)) = claimed else {
+            panic!("expected queued daemon download");
+        };
+
+        assert_eq!(claimed_id, first_id);
+        assert_eq!(claimed_request.url, "https://example.com/first");
+        assert_eq!(status_for(&db, first_id), "starting");
+        assert_eq!(status_for(&db, second_id), "queued");
+    }
+
+    #[test]
+    fn test_normalize_running_to_paused_skips_daemon_downloads() {
+        let (_temp_dir, db) = open_test_db();
+        let local_id = db
+            .insert_download("https://example.com/local", Path::new(""))
+            .unwrap();
+        let daemon_id = db
+            .insert_daemon_download(&request("https://example.com/daemon"))
+            .unwrap();
+        let claimed = db.claim_next_daemon_download().unwrap();
+        let Some((claimed_id, daemon_request)) = claimed else {
+            panic!("expected daemon download");
+        };
+        assert_eq!(claimed_id, daemon_id);
+        db.update_daemon_request(daemon_id, &daemon_request)
+            .unwrap();
+        db.update_download_started(daemon_id, Path::new("/tmp/file.bin"), Some(100), 20)
+            .unwrap();
+
+        db.normalize_running_to_paused().unwrap();
+
+        assert_eq!(status_for(&db, local_id), "paused");
+        assert_eq!(status_for(&db, daemon_id), "running");
+    }
+
+    #[test]
+    fn test_recover_daemon_downloads_requeues_in_progress_jobs() {
+        let (_temp_dir, db) = open_test_db();
+        let queued_id = db
+            .insert_daemon_download(&request("https://example.com/queued"))
+            .unwrap();
+        let running_id = db
+            .insert_daemon_download(&request("https://example.com/running"))
+            .unwrap();
+        let starting_id = db
+            .insert_daemon_download(&request("https://example.com/starting"))
+            .unwrap();
+        let paused_id = db
+            .insert_daemon_download(&request("https://example.com/paused"))
+            .unwrap();
+
+        let claimed = db.claim_next_daemon_download().unwrap();
+        let Some((claimed_id, _queued_request)) = claimed else {
+            panic!("expected running daemon download");
+        };
+        assert_eq!(claimed_id, queued_id);
+
+        let claimed = db.claim_next_daemon_download().unwrap();
+        let Some((claimed_id, running_request)) = claimed else {
+            panic!("expected running daemon download");
+        };
+        assert_eq!(claimed_id, running_id);
+        db.update_daemon_request(running_id, &running_request)
+            .unwrap();
+        db.update_download_started(running_id, Path::new("/tmp/running.bin"), Some(100), 20)
+            .unwrap();
+
+        let claimed = db.claim_next_daemon_download().unwrap();
+        let Some((claimed_id, _starting_request)) = claimed else {
+            panic!("expected starting daemon download");
+        };
+        assert_eq!(claimed_id, starting_id);
+
+        db.conn
+            .execute(
+                "UPDATE downloads SET status = 'paused' WHERE id = ?1",
+                params![paused_id],
+            )
+            .unwrap();
+
+        db.recover_daemon_downloads().unwrap();
+
+        assert_eq!(status_for(&db, queued_id), "queued");
+        assert_eq!(status_for(&db, running_id), "queued");
+        assert_eq!(status_for(&db, starting_id), "queued");
+        assert_eq!(status_for(&db, paused_id), "paused");
+    }
 }

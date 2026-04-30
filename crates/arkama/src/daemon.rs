@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -115,13 +114,9 @@ pub struct DaemonStatus {
     pub queued: usize,
 }
 
-struct PendingDownload {
-    id: i64,
-    request: DownloadRequest,
-}
-
 struct ActiveDownload {
     id: i64,
+    request: DownloadRequest,
     receiver: tokio_mpsc::UnboundedReceiver<DownloadEvent>,
     done_rx: mpsc::Receiver<Result<DownloadSummary>>,
     control: DownloadControl,
@@ -150,15 +145,13 @@ struct DaemonState {
     db: Db,
     max_concurrent: usize,
     active: Vec<ActiveDownload>,
-    pending: VecDeque<PendingDownload>,
     stopping: bool,
 }
 
 impl DaemonState {
     fn new(runtime: Handle) -> Result<Self> {
         let db = Db::open()?;
-        db.normalize_running_to_paused()?;
-        db.normalize_queued_to_paused()?;
+        db.recover_daemon_downloads()?;
         let max_concurrent = db
             .get_setting("max_concurrent")?
             .and_then(|value| value.parse().ok())
@@ -170,22 +163,21 @@ impl DaemonState {
             db,
             max_concurrent,
             active: Vec::new(),
-            pending: VecDeque::new(),
             stopping: false,
         })
     }
 
-    fn status(&self) -> DaemonStatus {
-        DaemonStatus {
+    fn status(&self) -> Result<DaemonStatus> {
+        Ok(DaemonStatus {
             pid: std::process::id(),
             active: self.active.len(),
-            queued: self.pending.len(),
-        }
+            queued: self.db.count_queued_daemon_downloads()?,
+        })
     }
 
     fn handle_request(&mut self, request: DaemonRequest) -> Result<DaemonResponse> {
         match request {
-            DaemonRequest::Ping => Ok(DaemonResponse::Pong(self.status())),
+            DaemonRequest::Ping => Ok(DaemonResponse::Pong(self.status()?)),
             DaemonRequest::Shutdown => {
                 self.begin_shutdown()?;
                 Ok(DaemonResponse::ShuttingDown)
@@ -202,11 +194,7 @@ impl DaemonState {
             return Ok(-1);
         }
 
-        let output = queued_output_path(&request);
-        let id = self
-            .db
-            .insert_download_with_status(&request.url, &output, "queued")?;
-        self.pending.push_back(PendingDownload { id, request });
+        let id = self.db.insert_daemon_download(&request)?;
         self.schedule()?;
         Ok(id)
     }
@@ -217,16 +205,19 @@ impl DaemonState {
         }
 
         while self.active.len() < self.max_concurrent {
-            let Some(pending) = self.pending.pop_front() else {
+            let Some((id, request)) = self.db.claim_next_daemon_download()? else {
                 break;
             };
-            self.start_one(pending)?;
+            if let Err(err) = self.start_one(id, request) {
+                self.db.update_download_failed(id, &err.to_string())?;
+                error!("failed to start queued download {id}: {err:#}");
+            }
         }
         Ok(())
     }
 
-    fn start_one(&mut self, pending: PendingDownload) -> Result<()> {
-        let handle = start_download_with_handle(self.runtime.clone(), pending.request)?;
+    fn start_one(&mut self, id: i64, request: DownloadRequest) -> Result<()> {
+        let handle = start_download_with_handle(self.runtime.clone(), request.clone())?;
 
         let (done_tx, done_rx) = mpsc::channel();
         let join = handle.join;
@@ -239,7 +230,8 @@ impl DaemonState {
         });
 
         self.active.push(ActiveDownload {
-            id: pending.id,
+            id,
+            request,
             receiver: handle.events,
             done_rx,
             control: handle.control,
@@ -258,13 +250,9 @@ impl DaemonState {
 
         self.stopping = true;
 
-        while let Some(pending) = self.pending.pop_front() {
-            self.db.update_download_paused(pending.id, 0)?;
-        }
-
         for active in &mut self.active {
             self.db
-                .update_download_paused(active.id, active.downloaded_bytes)?;
+                .requeue_download(active.id, active.downloaded_bytes)?;
             active.control.pause();
         }
 
@@ -273,7 +261,7 @@ impl DaemonState {
 
     fn poll_active(&mut self) -> Result<()> {
         let mut finished: Vec<(i64, DownloadSummary)> = Vec::new();
-        let mut failed: Vec<(i64, String)> = Vec::new();
+        let mut failed: Vec<(i64, String, u64)> = Vec::new();
 
         for active in &mut self.active {
             let mut processed = 0usize;
@@ -286,6 +274,8 @@ impl DaemonState {
                             resumed_bytes,
                         } => {
                             active.downloaded_bytes = resumed_bytes;
+                            active.request.output = Some(output.clone());
+                            self.db.update_daemon_request(active.id, &active.request)?;
                             self.db.update_download_started(
                                 active.id,
                                 &output,
@@ -317,7 +307,7 @@ impl DaemonState {
                             break;
                         }
                         DownloadEvent::Failed { message } => {
-                            failed.push((active.id, message));
+                            failed.push((active.id, message, active.downloaded_bytes));
                             break;
                         }
                     },
@@ -329,7 +319,7 @@ impl DaemonState {
 
             match active.done_rx.try_recv() {
                 Ok(Ok(summary)) => finished.push((active.id, summary)),
-                Ok(Err(err)) => failed.push((active.id, err.to_string())),
+                Ok(Err(err)) => failed.push((active.id, err.to_string(), active.downloaded_bytes)),
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
@@ -340,8 +330,10 @@ impl DaemonState {
             self.active.retain(|active| active.id != id);
         }
 
-        for (id, message) in failed {
-            if message != "interrupted" {
+        for (id, message, downloaded_bytes) in failed {
+            if message == "interrupted" {
+                self.db.requeue_download(id, downloaded_bytes)?;
+            } else {
                 self.db.update_download_failed(id, &message)?;
             }
             self.active.retain(|active| active.id != id);
@@ -404,6 +396,7 @@ async fn run_foreground() -> Result<()> {
     let _guard = AddrFileGuard { path: addr_path };
     let runtime = Handle::current();
     let mut daemon = DaemonState::new(runtime)?;
+    daemon.schedule()?;
     let (command_tx, mut command_rx) = tokio_mpsc::unbounded_channel::<CommandMessage>();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
 
@@ -586,13 +579,6 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
         .await
         .context("failed to read daemon response")?;
     serde_json::from_str(&line).context("invalid daemon response")
-}
-
-fn queued_output_path(request: &DownloadRequest) -> PathBuf {
-    let Some(path) = request.output.clone() else {
-        return PathBuf::new();
-    };
-    path
 }
 
 fn daemon_bind_addr() -> Result<SocketAddr> {

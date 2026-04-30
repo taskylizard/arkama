@@ -29,7 +29,7 @@ Both CLI and the desktop apps are kept upto date on feature parity.
 - Optional global speed limit.
 - Experimental connection entropy mode for LACP/ECMP environments.
 - Download history backed by SQLite.
-- Background daemon with local TCP control.
+- Background daemon with local TCP control and persisted queue recovery.
 - Search across past downloads.
 - Configurable download folder (persisted in app settings).
 - Live progress and status in the UI.
@@ -77,6 +77,9 @@ Manage the background daemon.
 - `arkama-cli daemon run`: run the daemon in the foreground.
 - `arkama-cli daemon status`: show daemon status.
 - `arkama-cli daemon stop`: stop the daemon.
+
+Queued daemon jobs are stored in the shared SQLite database, survive daemon restarts, and are
+recovered automatically when the daemon starts again.
 
 ### `arkama-cli history [OPTIONS]`
 

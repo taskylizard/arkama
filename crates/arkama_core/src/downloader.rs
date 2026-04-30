@@ -42,7 +42,7 @@ use url::Url;
 /// let _ = handle;
 /// # Ok(()) }
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub url: String,
     pub output: Option<PathBuf>,
