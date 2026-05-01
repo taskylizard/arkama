@@ -2,7 +2,7 @@
 
 Very, _very_, _very_, work in progress, proceed with fire!
 
-Fast, practical download manager. Ships as `arkama-cli`, `arkama-gui`, and the combined `arkama` binary.
+Fast, practical download manager. Ships as `arkama-cli` and the combined `arkama` binary.
 
 ## 🧭 Quick start (CLI)
 
@@ -14,9 +14,11 @@ arkama-cli daemon start
 arkama-cli download <url> --daemon
 ```
 
+You can replace `arkama-cli` with `arkama` in the examples below if you prefer the combined binary.
+
 ## ✨ Features
 
-Both CLI and the desktop apps are kept upto date on feature parity.
+CLI-first for now.
 
 - HTTP/HTTPS downloads with redirects.
 - Filename inference from `Content-Disposition` or URL path.
@@ -32,14 +34,14 @@ Both CLI and the desktop apps are kept upto date on feature parity.
 - Background daemon with local TCP control and persisted queue recovery.
 - Search across past downloads.
 - Configurable download folder (persisted in app settings).
-- Live progress and status in the UI.
+- JSON output for automation.
 
 ## 🔄 Shared configuration
 
-All three binaries share the same SQLite database for settings and download history:
+Both binaries share the same SQLite database for settings and download history:
 
 ```bash
-# Set download folder (used by both CLI and GUI)
+# Set download folder (used by both binaries)
 arkama-cli config set download_dir ~/Downloads
 arkama-cli config set connections 8
 arkama-cli config set speed_limit 2MB
@@ -103,13 +105,9 @@ Common keys:
 - `max_concurrent`
 - `speed_limit`
 
-### `arkama-gui`
+### `arkama <COMMAND>`
 
-Launch the graphical user interface directly.
-
-### `arkama gui`
-
-Launch the graphical user interface through the combined binary.
+The `arkama` binary exposes the same CLI commands as `arkama-cli`.
 
 ### Global options
 
@@ -165,11 +163,4 @@ arkama-cli config show
 arkama-cli config set download_dir ~/Downloads
 arkama-cli history
 arkama-cli history -n 10 -q "zip"
-
-# Launch GUI
-arkama-gui
-arkama gui
-
-# Launch GUI from the combined binary (default when no command given)
-arkama
 ```

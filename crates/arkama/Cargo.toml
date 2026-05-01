@@ -11,21 +11,13 @@ path = "src/main.rs"
 name = "arkama-cli"
 path = "src/bin/arkama-cli.rs"
 
-[[bin]]
-name = "arkama-gui"
-path = "src/bin/arkama-gui.rs"
-
 [dependencies]
 arkama_core = { path = "../arkama_core" }
 arkama_data = { path = "../arkama_data" }
 bytefmt.workspace = true
 clap.workspace = true
-eframe = "0.27"
-egui_extras = "0.27"
 eyre.workspace = true
 indicatif.workspace = true
-notify-rust = "4"
-rfd = "0.14"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -34,9 +26,6 @@ tracing-subscriber.workspace = true
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"
 comfy-table = "7.2.2"
-console = "0.15"
-dialoguer = "0.11"
-open = "5"
 owo-colors = "4"
 
 [dev-dependencies]

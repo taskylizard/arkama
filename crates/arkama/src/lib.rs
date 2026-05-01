@@ -3,20 +3,23 @@ mod completions;
 mod config;
 mod daemon;
 mod download;
-mod gui;
 mod history;
 mod progress;
 mod util;
 
 use clap::{Args, Parser, Subcommand};
 use eyre::Result;
-use tokio::task;
 
 #[derive(Parser)]
-#[command(name = "arkama", version, about = "High-performance download manager")]
+#[command(
+    name = "arkama",
+    version,
+    about = "High-performance download manager",
+    arg_required_else_help = true
+)]
 struct CombinedArgs {
     #[command(subcommand)]
-    command: Option<CombinedCommand>,
+    command: CombinedCommand,
 
     #[arg(long = "reset-db", help = "Reset the application database.")]
     reset_db: bool,
@@ -29,9 +32,6 @@ enum CombinedCommand {
 
     #[command(about = "Run or manage the background daemon.")]
     Daemon(DaemonCliArgs),
-
-    #[command(about = "Launch the graphical user interface.")]
-    Gui,
 
     #[command(about = "Show download history.")]
     History(history::HistoryArgs),
@@ -76,17 +76,6 @@ enum CliCommand {
     Completions(completions::CompletionsArgs),
 }
 
-#[derive(Parser)]
-#[command(
-    name = "arkama-gui",
-    version,
-    about = "High-performance download manager GUI"
-)]
-struct GuiArgs {
-    #[arg(long = "reset-db", help = "Reset the application database.")]
-    reset_db: bool,
-}
-
 #[derive(Args, Debug)]
 struct DaemonCliArgs {
     #[command(subcommand)]
@@ -101,15 +90,13 @@ pub async fn run_combined() -> Result<()> {
     }
 
     match args.command {
-        Some(CombinedCommand::Download(download_args)) => download::run(download_args).await,
-        Some(CombinedCommand::Daemon(daemon_args)) => daemon::run(daemon_args.command).await,
-        Some(CombinedCommand::Gui) => run_gui().await,
-        Some(CombinedCommand::History(history_args)) => history::run(history_args),
-        Some(CombinedCommand::Config(config_args)) => config::run(config_args),
-        Some(CombinedCommand::Completions(completions_args)) => {
+        CombinedCommand::Download(download_args) => download::run(download_args).await,
+        CombinedCommand::Daemon(daemon_args) => daemon::run(daemon_args.command).await,
+        CombinedCommand::History(history_args) => history::run(history_args),
+        CombinedCommand::Config(config_args) => config::run(config_args),
+        CombinedCommand::Completions(completions_args) => {
             completions::run::<CombinedArgs>(completions_args, "arkama")
         }
-        None => run_gui().await,
     }
 }
 
@@ -129,20 +116,4 @@ pub async fn run_cli() -> Result<()> {
             completions::run::<CliArgs>(completions_args, "arkama-cli")
         }
     }
-}
-
-pub async fn run_gui_app() -> Result<()> {
-    let args = GuiArgs::parse();
-
-    if args.reset_db {
-        arkama_data::reset_db()?;
-    }
-
-    run_gui().await
-}
-
-async fn run_gui() -> Result<()> {
-    task::spawn_blocking(gui::run)
-        .await
-        .map_err(|err| eyre::eyre!(err))?
 }
