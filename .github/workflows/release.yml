@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTC_WRAPPER: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: linux
+            exe_suffix: ""
+          - os: macos-latest
+            artifact_name: macos
+            exe_suffix: ""
+          - os: windows-latest
+            artifact_name: windows
+            exe_suffix: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo build release
+        run: cargo build --release --package arkama --bins --locked
+
+      - name: package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/arkama-${{ matrix.artifact_name }}
+          cp target/release/arkama${{ matrix.exe_suffix }} dist/arkama-${{ matrix.artifact_name }}/arkama${{ matrix.exe_suffix }}
+          cp target/release/arkama-cli${{ matrix.exe_suffix }} dist/arkama-${{ matrix.artifact_name }}/arkama-cli${{ matrix.exe_suffix }}
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arkama-${{ matrix.artifact_name }}
+          path: dist/arkama-${{ matrix.artifact_name }}/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: zip artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          for path in Path("dist").iterdir():
+              if not path.is_dir():
+                  continue
+              zip_path = path.with_suffix(".zip")
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for file in path.rglob("*"):
+                      if file.is_file():
+                          zf.write(file, arcname=file.relative_to(path))
+          PY
+          find dist -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
