@@ -18,26 +18,23 @@ async fn serve_file(req: Request<hyper::body::Incoming>, data: Bytes) -> Respons
     }
 
     let mut body = data.clone();
-    if let Some(range) = req.headers().get(hyper::header::RANGE) {
-        if let Ok(range) = range.to_str() {
-            if let Some(start) = range.strip_prefix("bytes=") {
-                if let Some((start, end)) = start.split_once('-') {
-                    if let Ok(start) = start.parse::<usize>() {
-                        let end = end
-                            .parse::<usize>()
-                            .ok()
-                            .map(|e| e + 1)
-                            .unwrap_or(data.len());
-                        body = data.slice(start.min(data.len())..end.min(data.len()));
-                        builder = builder.status(StatusCode::PARTIAL_CONTENT);
-                        builder = builder.header(
-                            "content-range",
-                            format!("bytes {}-{}/{}", start, end - 1, data.len()),
-                        );
-                    }
-                }
-            }
-        }
+    if let Some(range) = req.headers().get(hyper::header::RANGE)
+        && let Ok(range) = range.to_str()
+        && let Some(start) = range.strip_prefix("bytes=")
+        && let Some((start, end)) = start.split_once('-')
+        && let Ok(start) = start.parse::<usize>()
+    {
+        let end = end
+            .parse::<usize>()
+            .ok()
+            .map(|e| e + 1)
+            .unwrap_or(data.len());
+        body = data.slice(start.min(data.len())..end.min(data.len()));
+        builder = builder.status(StatusCode::PARTIAL_CONTENT);
+        builder = builder.header(
+            "content-range",
+            format!("bytes {}-{}/{}", start, end - 1, data.len()),
+        );
     }
 
     builder = builder.header("accept-ranges", "bytes");

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use arkama_core::{DownloadEvent, DownloadRequest, download, start_download};
@@ -21,7 +21,7 @@ fn request(url: String, path: PathBuf, connections: usize) -> DownloadRequest {
     }
 }
 
-fn state_path(path: &PathBuf) -> PathBuf {
+fn state_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.arkama.state", path.to_string_lossy()))
 }
 

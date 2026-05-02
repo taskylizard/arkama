@@ -1201,6 +1201,7 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                     let stop_signal = *stop_rx.borrow();
                     if stop_signal != StopSignal::None {
                         if pending_state_sync > 0 {
+                            file.flush().await?;
                             update_state(&state, &segment).await?;
                         }
                         return Err(eyre::Report::new(stop_signal));
@@ -1227,6 +1228,7 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                                 },
                             );
                             if pending_state_sync >= STATE_SYNC_BATCH_BYTES {
+                                file.flush().await?;
                                 update_state(&state, &segment).await?;
                                 pending_state_sync = 0;
                             }
@@ -1239,6 +1241,7 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                                     };
                                     if should_recycle {
                                         if pending_state_sync > 0 {
+                                            file.flush().await?;
                                             update_state(&state, &segment).await?;
                                         }
                                         recycle = true;
@@ -1249,6 +1252,7 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                         }
                         Some(Err(err)) => {
                             if pending_state_sync > 0 {
+                                file.flush().await?;
                                 update_state(&state, &segment).await?;
                             }
                             attempts += 1;
@@ -1261,6 +1265,7 @@ async fn download_segment(context: DownloadSegmentContext, mut segment: Segment)
                             break;
                         }
                         None => {
+                            file.flush().await?;
                             if pending_state_sync > 0 {
                                 update_state(&state, &segment).await?;
                             }
@@ -1319,9 +1324,10 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
             return Err(eyre::Report::new(stop_signal));
         }
 
+        let request_start = offset;
         let client = client_factory.client()?;
-        let response = if offset > 0 {
-            http::get_range(&client, &url, offset, None).await
+        let response = if accept_ranges && request_start > 0 {
+            http::get_range(&client, &url, request_start, None).await
         } else {
             http::get_full(&client, &url).await
         };
@@ -1338,7 +1344,7 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
             }
         };
 
-        if offset > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        if request_start > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             if accept_ranges {
                 let _ = fs::remove_file(&output);
                 offset = 0;
@@ -1367,6 +1373,7 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
                 _ = stop_rx.changed() => {
                     let stop_signal = *stop_rx.borrow();
                     if stop_signal != StopSignal::None {
+                        file.flush().await?;
                         return Err(eyre::Report::new(stop_signal));
                     }
                 }
@@ -1390,6 +1397,7 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
                             );
                         }
                         Some(Err(err)) => {
+                            file.flush().await?;
                             attempts += 1;
                             if attempts > 5 {
                                 return Err(eyre::eyre!("download failed: {err}"));
@@ -1404,13 +1412,19 @@ async fn download_single(context: DownloadSingleContext) -> Result<()> {
                             break;
                         }
                         None => {
-                            let downloaded = offset.saturating_sub(start);
+                            file.flush().await?;
+                            let downloaded = offset.saturating_sub(request_start);
                             if let Some(total) = total_size {
-                                let expected = total.saturating_sub(start);
+                                let expected = total.saturating_sub(request_start);
                                 if downloaded < expected {
                                     attempts += 1;
                                     if attempts > 5 {
                                         return Err(eyre::eyre!("download ended early"));
+                                    }
+                                    if !accept_ranges {
+                                        let _ = fs::remove_file(&output);
+                                        offset = 0;
+                                        total_downloaded.store(0, Ordering::Relaxed);
                                     }
                                     let backoff = backoff_delay(attempts);
                                     tokio::time::sleep(backoff).await;
