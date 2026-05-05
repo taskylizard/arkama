@@ -1,8 +1,10 @@
+mod api;
 mod downloader;
 mod http;
 mod segment;
 
-pub use downloader::{
-    DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary, download,
-    start_download, start_download_with_handle,
+pub use api::{
+    DEFAULT_CONNECTIONS, DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest,
+    DownloadRequestBuilder, DownloadSummary,
 };
+pub use downloader::{download, start_download, start_download_with_handle};

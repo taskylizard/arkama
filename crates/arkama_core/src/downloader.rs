@@ -1,3 +1,6 @@
+use crate::api::{
+    DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary,
+};
 use crate::http::{self, ClientFactory, HttpMeta};
 use crate::segment::{Segment, build_segments, build_segments_with_chunk_size};
 use eyre::{Context, Result};
@@ -20,158 +23,6 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use url::Url;
 
-/// Describes a download request.
-///
-/// # Examples
-///
-/// ```no_run
-/// use arkama_core::{DownloadRequest, start_download};
-///
-/// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
-/// let handle = start_download(request)?;
-/// let _ = handle;
-/// # Ok(()) }
-/// ```
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DownloadRequest {
-    pub url: String,
-    pub output: Option<PathBuf>,
-    pub output_dir: Option<PathBuf>,
-    pub connections: usize,
-    pub user_agent: Option<String>,
-    pub limit: Option<u64>,
-    pub experimental_entropy: bool,
-}
-
-/// Reports lifecycle updates for a download.
-///
-/// # Examples
-///
-/// ```no_run
-/// use arkama_core::{DownloadEvent, DownloadRequest, start_download};
-///
-/// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
-/// let mut handle = start_download(request)?;
-/// while let Some(event) = handle.events.recv().await {
-///     let event = event;
-///     let _ = event;
-/// }
-/// # Ok(()) }
-/// ```
-#[derive(Debug, Clone)]
-pub enum DownloadEvent {
-    Started {
-        output: PathBuf,
-        total_bytes: Option<u64>,
-        resumed_bytes: u64,
-    },
-    Progress {
-        downloaded_bytes: u64,
-        total_bytes: Option<u64>,
-    },
-    Finished {
-        summary: DownloadSummary,
-    },
-    Failed {
-        message: String,
-    },
-}
-
-/// Holds the completion details for a download.
-///
-/// # Examples
-///
-/// ```no_run
-/// use arkama_core::{DownloadRequest, start_download};
-///
-/// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
-/// let mut handle = start_download(request)?;
-/// let summary = handle.join.await??;
-/// let _ = summary;
-/// # Ok(()) }
-/// ```
-#[derive(Debug, Clone)]
-pub struct DownloadSummary {
-    pub output: PathBuf,
-    pub total_bytes: u64,
-    pub downloaded_bytes: u64,
-    pub resumed_bytes: u64,
-    pub elapsed: Duration,
-}
-
-/// Provides the event stream and task handle for a download.
-///
-/// # Examples
-///
-/// ```no_run
-/// use arkama_core::{DownloadRequest, start_download};
-///
-/// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
-/// let handle = start_download(request)?;
-/// let _ = handle;
-/// # Ok(()) }
-/// ```
-pub struct DownloadHandle {
-    pub events: mpsc::UnboundedReceiver<DownloadEvent>,
-    pub join: JoinHandle<Result<DownloadSummary>>,
-    pub control: DownloadControl,
-}
-
-#[derive(Clone)]
-pub struct DownloadControl {
-    stop_tx: watch::Sender<StopSignal>,
-}
-
-impl DownloadControl {
-    pub fn pause(&self) {
-        let _ = self.stop_tx.send(StopSignal::Pause);
-    }
-
-    pub fn cancel(&self) {
-        let _ = self.stop_tx.send(StopSignal::Cancel);
-    }
-}
-
 /// Starts a download on a background task.
 ///
 /// # Errors
@@ -185,15 +36,7 @@ impl DownloadControl {
 ///
 /// # #[tokio::main]
 /// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
+/// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let handle = start_download(request)?;
 /// let _ = handle;
 /// # Ok(()) }
@@ -216,15 +59,7 @@ pub fn start_download(request: DownloadRequest) -> Result<DownloadHandle> {
 ///
 /// # #[tokio::main]
 /// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
+/// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let handle = start_download_with_handle(tokio::runtime::Handle::current(), request)?;
 /// let _ = handle;
 /// # Ok(()) }
@@ -258,15 +93,7 @@ pub fn start_download_with_handle(
 ///
 /// # #[tokio::main]
 /// # async fn main() -> eyre::Result<()> {
-/// let request = DownloadRequest {
-///     url: "https://example.com/file.bin".to_string(),
-///     output: None,
-///     output_dir: None,
-///     connections: 4,
-///     user_agent: None,
-///     limit: None,
-///     experimental_entropy: false,
-/// };
+/// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let summary = download(request).await?;
 /// let _ = summary;
 /// # Ok(()) }
@@ -335,7 +162,7 @@ impl fmt::Display for RangeUnsupported {
 impl Error for RangeUnsupported {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StopSignal {
+pub(crate) enum StopSignal {
     None,
     Pause,
     Cancel,
