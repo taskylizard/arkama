@@ -1,5 +1,5 @@
 use crate::downloader::StopSignal;
-use eyre::Result;
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,7 +20,7 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 /// use arkama_core::{DownloadRequest, download};
 ///
 /// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
+/// # async fn main() -> arkama_core::Result<()> {
 /// let request = DownloadRequest::new("https://example.com/file.bin")
 ///     .output("./file.bin")
 ///     .connections(8)
@@ -223,7 +223,7 @@ impl From<DownloadRequestBuilder> for DownloadRequest {
 /// use arkama_core::{DownloadEvent, DownloadRequest, start_download};
 ///
 /// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
+/// # async fn main() -> arkama_core::Result<()> {
 /// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let mut handle = start_download(request)?;
 /// while let Some(event) = handle.events.recv().await {

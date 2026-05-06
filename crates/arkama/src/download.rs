@@ -210,7 +210,7 @@ async fn run_single_silent(db: &Db, request: DownloadRequest, url: &str) -> Resu
         }
         Err(err) => {
             db.update_download_failed(id, &err.to_string())?;
-            return Err(err);
+            return Err(err.into());
         }
     }
     Ok(())
@@ -270,7 +270,7 @@ async fn run_single_console(db: &Db, request: DownloadRequest, url: &str) -> Res
                     }
                     Err(err) => {
                         db.update_download_failed(id, &err.to_string())?;
-                        return Err(err);
+                        return Err(err.into());
                     }
                 }
                 break;
@@ -345,7 +345,7 @@ async fn run_single_json(db: &Db, request: DownloadRequest, url: String) -> Resu
                                 "message": err.to_string()
                             }))?;
                         }
-                        return Err(err);
+                        return Err(err.into());
                     }
                     Err(err) => {
                         if !finished_emitted {

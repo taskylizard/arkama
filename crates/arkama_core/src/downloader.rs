@@ -1,7 +1,7 @@
 use crate::api::{
     DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary,
 };
-use eyre::{Context, Result};
+use crate::error::{Error, Result};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 
@@ -28,14 +28,15 @@ use engine::download_inner;
 /// use arkama_core::{DownloadRequest, start_download};
 ///
 /// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
+/// # async fn main() -> arkama_core::Result<()> {
 /// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let handle = start_download(request)?;
 /// let _ = handle;
 /// # Ok(()) }
 /// ```
 pub fn start_download(request: DownloadRequest) -> Result<DownloadHandle> {
-    let handle = Handle::try_current().context("start_download requires a Tokio runtime")?;
+    let handle = Handle::try_current()
+        .map_err(|_| Error::runtime_unavailable("start_download requires a Tokio runtime"))?;
     start_download_with_handle(handle, request)
 }
 
@@ -51,7 +52,7 @@ pub fn start_download(request: DownloadRequest) -> Result<DownloadHandle> {
 /// use arkama_core::{DownloadRequest, start_download_with_handle};
 ///
 /// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
+/// # async fn main() -> arkama_core::Result<()> {
 /// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let handle = start_download_with_handle(tokio::runtime::Handle::current(), request)?;
 /// let _ = handle;
@@ -64,8 +65,11 @@ pub fn start_download_with_handle(
     let (tx, rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
     let join_stop_tx = stop_tx.clone();
-    let join =
-        handle.spawn(async move { download_inner(request, Some(tx), join_stop_tx, stop_rx).await });
+    let join = handle.spawn(async move {
+        download_inner(request, Some(tx), join_stop_tx, stop_rx)
+            .await
+            .map_err(map_download_error)
+    });
     Ok(DownloadHandle {
         events: rx,
         join,
@@ -85,7 +89,7 @@ pub fn start_download_with_handle(
 /// use arkama_core::{DownloadRequest, download};
 ///
 /// # #[tokio::main]
-/// # async fn main() -> eyre::Result<()> {
+/// # async fn main() -> arkama_core::Result<()> {
 /// let request = DownloadRequest::new("https://example.com/file.bin");
 /// let summary = download(request).await?;
 /// let _ = summary;
@@ -93,7 +97,35 @@ pub fn start_download_with_handle(
 /// ```
 pub async fn download(request: DownloadRequest) -> Result<DownloadSummary> {
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
-    download_inner(request, None, stop_tx, stop_rx).await
+    download_inner(request, None, stop_tx, stop_rx)
+        .await
+        .map_err(map_download_error)
+}
+
+fn map_download_error(err: eyre::Report) -> Error {
+    if let Some(stop_signal) = err.downcast_ref::<StopSignal>() {
+        return match stop_signal {
+            StopSignal::None => Error::download_failed(err.to_string()),
+            StopSignal::Pause => Error::Paused,
+            StopSignal::Cancel => Error::Cancelled,
+        };
+    }
+
+    let message = err.to_string();
+    if err.downcast_ref::<url::ParseError>().is_some() {
+        return Error::InvalidUrl { message };
+    }
+    if err.downcast_ref::<reqwest::Error>().is_some() {
+        return Error::Http { message };
+    }
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        return Error::Io { message };
+    }
+    if err.downcast_ref::<serde_json::Error>().is_some() {
+        return Error::State { message };
+    }
+
+    Error::DownloadFailed { message }
 }
 
 fn send_event(events: &Option<mpsc::UnboundedSender<DownloadEvent>>, event: DownloadEvent) {

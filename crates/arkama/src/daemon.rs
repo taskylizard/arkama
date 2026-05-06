@@ -223,7 +223,8 @@ impl DaemonState {
         let join = handle.join;
         self.runtime.spawn(async move {
             let result = match join.await {
-                Ok(inner) => inner,
+                Ok(Ok(summary)) => Ok(summary),
+                Ok(Err(err)) => Err(err.into()),
                 Err(err) => Err(eyre::eyre!(err)),
             };
             let _ = done_tx.send(result);
