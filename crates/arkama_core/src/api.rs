@@ -1,5 +1,6 @@
 use crate::downloader::StopSignal;
 use crate::error::Result;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,7 +31,8 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 /// let _ = summary;
 /// # Ok(()) }
 /// ```
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
 pub struct DownloadRequest {
     pub url: String,
     pub output: Option<PathBuf>,

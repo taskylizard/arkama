@@ -64,9 +64,13 @@
 //!
 //! # Feature flags
 //!
-//! `arkama_core` currently does not define crate-specific optional feature flags. Dependency
-//! features are selected through the workspace today, including Reqwest with Rustls TLS and Tokio's
-//! full feature set. Feature and dependency cleanup is planned for a later publication phase.
+//! The default feature set is `rustls-tls` and `serde`:
+//!
+//! - `rustls-tls` enables Reqwest's Rustls TLS backend.
+//! - `native-tls` enables Reqwest's native TLS backend instead or in addition.
+//! - `serde` enables `Serialize`/`Deserialize` for public request types and the internal persisted
+//!   resume-state format. Disabling it still compiles the downloader, but persisted resume state is
+//!   unavailable.
 //!
 mod api;
 mod downloader;

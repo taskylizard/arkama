@@ -121,6 +121,7 @@ fn map_download_error(err: eyre::Report) -> Error {
     if err.downcast_ref::<std::io::Error>().is_some() {
         return Error::Io { message };
     }
+    #[cfg(feature = "serde")]
     if err.downcast_ref::<serde_json::Error>().is_some() {
         return Error::State { message };
     }

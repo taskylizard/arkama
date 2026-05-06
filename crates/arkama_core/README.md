@@ -93,9 +93,18 @@ approximate global byte-per-second limit for a download.
 
 ## Feature flags
 
-`arkama_core` currently has no crate-defined optional feature flags. Dependency feature selection is
-still inherited from the workspace, including Reqwest with Rustls TLS and Tokio's full feature set.
-Dependency and feature cleanup is planned for a later publication phase.
+Default features:
+
+- `rustls-tls`: enables Reqwest's Rustls TLS backend.
+- `serde`: enables `Serialize`/`Deserialize` for public request types and the internal persisted
+  resume-state format.
+
+Optional features:
+
+- `native-tls`: enables Reqwest's native TLS backend instead or in addition.
+
+If `serde` is disabled with `default-features = false`, the downloader still compiles, but persisted
+resume state is unavailable.
 
 ## Examples
 

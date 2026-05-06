@@ -1,21 +1,26 @@
 use crate::segment::Segment;
-use eyre::{Context, Result};
+#[cfg(feature = "serde")]
+use eyre::Context;
+use eyre::Result;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "serde")]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, watch};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug)]
 pub(crate) struct DownloadState {
     pub(crate) url: String,
     pub(crate) output: PathBuf,
     pub(crate) total_size: Option<u64>,
     pub(crate) segments: Vec<Segment>,
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) segment_size: Option<u64>,
-    #[serde(default)]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) experimental_entropy: bool,
 }
 
@@ -28,6 +33,7 @@ pub(crate) fn state_path(output: &Path) -> Result<PathBuf> {
     Ok(output.with_file_name(name))
 }
 
+#[cfg(feature = "serde")]
 pub(crate) fn load_state(path: &Path) -> Result<DownloadState> {
     let data =
         fs::read_to_string(path).with_context(|| format!("failed to read state {path:?}"))?;
@@ -35,6 +41,15 @@ pub(crate) fn load_state(path: &Path) -> Result<DownloadState> {
     Ok(state)
 }
 
+#[cfg(not(feature = "serde"))]
+pub(crate) fn load_state(path: &Path) -> Result<DownloadState> {
+    let _ = path;
+    Err(eyre::eyre!(
+        "resumable state loading requires the serde feature"
+    ))
+}
+
+#[cfg(feature = "serde")]
 pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>) -> Result<()> {
     let path = state_path(output)?;
     let state = state.lock().await;
@@ -45,6 +60,22 @@ pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>)
     Ok(())
 }
 
+#[cfg(not(feature = "serde"))]
+pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>) -> Result<()> {
+    let _ = output;
+    let state = state.lock().await;
+    let _ = (
+        &state.url,
+        &state.output,
+        &state.total_size,
+        &state.segments,
+        &state.segment_size,
+        &state.experimental_entropy,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
 pub(crate) async fn update_state(
     state: &TokioMutex<DownloadState>,
     updated: &Segment,
@@ -68,6 +99,17 @@ pub(crate) async fn update_state(
     Ok(())
 }
 
+#[cfg(not(feature = "serde"))]
+pub(crate) async fn update_state(
+    state: &TokioMutex<DownloadState>,
+    updated: &Segment,
+) -> Result<()> {
+    let _ = state;
+    let _ = (updated.id, updated.start, updated.end, updated.downloaded);
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
 pub(crate) async fn periodic_save(
     output: PathBuf,
     state: Arc<TokioMutex<DownloadState>>,
@@ -88,4 +130,18 @@ pub(crate) async fn periodic_save(
             }
         }
     }
+}
+
+#[cfg(not(feature = "serde"))]
+pub(crate) async fn periodic_save(
+    output: PathBuf,
+    state: Arc<TokioMutex<DownloadState>>,
+    stop_rx: watch::Receiver<bool>,
+    interval: Duration,
+) -> Result<()> {
+    let _ = output;
+    let _ = state;
+    let _ = stop_rx;
+    let _ = interval;
+    Ok(())
 }

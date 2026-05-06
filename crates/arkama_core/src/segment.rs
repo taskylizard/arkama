@@ -1,6 +1,8 @@
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone)]
 pub(crate) struct Segment {
     pub(crate) id: usize,
     pub(crate) start: u64,

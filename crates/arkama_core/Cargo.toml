@@ -2,14 +2,46 @@
 name = "arkama_core"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.85"
+description = "Core download engine for Arkama with resumable and segmented HTTP downloads"
+repository = "https://github.com/taskylizard/arkama"
+readme = "README.md"
+keywords = ["download", "http", "resume", "manager"]
+categories = ["asynchronous", "network-programming"]
+include = [
+  "Cargo.toml",
+  "README.md",
+  "src/**/*.rs",
+  "examples/**/*.rs",
+  "tests/**/*.rs",
+]
+
+[features]
+default = ["rustls-tls", "serde"]
+serde = ["dep:serde", "dep:serde_json"]
+rustls-tls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
 
 [dependencies]
 eyre.workspace = true
 futures-util.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = [
+  "brotli",
+  "deflate",
+  "gzip",
+  "stream",
+] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
 tracing.workspace = true
 url.workspace = true
 
@@ -18,3 +50,12 @@ hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
+tokio = { version = "1", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
