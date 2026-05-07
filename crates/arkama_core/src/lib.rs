@@ -1,9 +1,9 @@
-//! Core library API for Arkama downloads.
+//! Core library API for arkama downloads.
 //!
 //! `arkama_core` provides HTTP/HTTPS file downloads with filename inference, resume support,
 //! segmented downloads, progress events, pause/cancel controls, and optional global speed limits.
-//! The crate is intended for applications that want Arkama's downloader without depending on the
-//! Arkama CLI or daemon.
+//! The crate is intended for applications that want arkama's downloader without depending on the
+//! arkama CLI or daemon.
 //!
 //! # Quick start
 //!

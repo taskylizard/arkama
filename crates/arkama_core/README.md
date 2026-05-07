@@ -1,14 +1,14 @@
 # arkama_core
 
-Library API for Arkama's HTTP/HTTPS downloader.
+Library API for arkama's HTTP/HTTPS downloader.
 
-`arkama_core` is the reusable download engine used by the Arkama CLI. It is intended for Rust
+`arkama_core` is the reusable download engine used by the arkama CLI. It is intended for Rust
 applications that want file downloads with progress reporting, resume support, segmented transfers,
 pause/cancel controls, and optional speed limiting.
 
 ## Status
 
-Arkama is still early and the API is being prepared for crates.io publication. The public request
+arkama is still early and the API is being prepared for crates.io publication. The public request
 fields remain available for compatibility, but new code should prefer `DownloadRequest::new`, the
 chainable setters, or `DownloadRequest::builder`.
 
@@ -108,9 +108,4 @@ resume state is unavailable.
 
 ## Examples
 
-See the crate examples for library-oriented usage:
-
-- `simple.rs`
-- `progress.rs`
-- `pause_resume.rs`
-- `speed_limit.rs`
+See the crate examples for library-oriented usage inside `examples/`.

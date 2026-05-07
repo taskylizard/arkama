@@ -33,7 +33,7 @@ def ensure_files(root: Path) -> None:
 
 
 class RangeHandler(SimpleHTTPRequestHandler):
-    server_version = "ArkamaTestHTTP/1.0"
+    server_version = "arkamaTestHTTP/1.0"
 
     def _parse_range(self, size: int) -> Optional[Tuple[int, int]]:
         header = self.headers.get("Range")
@@ -122,7 +122,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local file server with Range support for Arkama testing.")
+    parser = argparse.ArgumentParser(description="Local file server with Range support for arkama testing.")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8088, help="Port (default: 8088)")
     parser.add_argument("--dir", default="testdata", help="Directory to serve (default: ./testdata)")

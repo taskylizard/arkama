@@ -67,7 +67,7 @@ Download a file from a URL.
 - `--user-agent <UA>`: override HTTP User-Agent.
 - `--limit <BYTES_PER_SEC>`: global speed limit (defaults to config if unset; ex: `2MB`, `500KB`).
 - `--experimental-entropy`: experimental; disables idle pooling, uses 4MB segments, and recycles slow segment connections.
-- `--daemon`: enqueue the download on the local Arkama daemon.
+- `--daemon`: enqueue the download on the local arkama daemon.
 - `--silent`: suppress progress and summary output.
 - `--json`: emit JSON events to stdout for automation.
 

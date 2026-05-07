@@ -1,5 +1,5 @@
 {
-  description = "Arkama Rust workspace development flake";
+  description = "arkama Rust workspace development flake";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

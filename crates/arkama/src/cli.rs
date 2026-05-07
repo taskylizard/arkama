@@ -53,7 +53,7 @@ pub struct DownloadArgs {
 
     #[arg(
         long = "daemon",
-        help = "Submit the download to the local Arkama daemon instead of downloading in the current process."
+        help = "Submit the download to the local arkama daemon instead of downloading in the current process."
     )]
     pub daemon: bool,
 
