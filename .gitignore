@@ -2,3 +2,5 @@
 *.arkama.state
 testdata
 trash/
+*.bin
+tmp/
