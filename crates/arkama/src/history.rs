@@ -39,7 +39,7 @@ pub fn run(args: HistoryArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_table(records: &[DownloadRecord]) -> String {
+pub(crate) fn render_table(records: &[DownloadRecord]) -> String {
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -55,7 +55,7 @@ fn render_table(records: &[DownloadRecord]) -> String {
     for record in records {
         table.add_row([
             Cell::new(record.id).set_alignment(CellAlignment::Right),
-            status_cell(&record.status),
+            status_cell(record),
             Cell::new(history_progress_text(
                 record.downloaded_bytes,
                 record.total_bytes,
@@ -75,7 +75,8 @@ fn header_cell(label: &str) -> Cell {
         .add_attribute(Attribute::Bold)
 }
 
-fn status_cell(status: &str) -> Cell {
+fn status_cell(record: &DownloadRecord) -> Cell {
+    let status = record.status.as_str();
     let color = if status.starts_with("failed") {
         Color::Red
     } else if status == "finished" {
@@ -92,5 +93,14 @@ fn status_cell(status: &str) -> Cell {
         Color::White
     };
 
-    Cell::new(status).fg(color)
+    let label = if status == "failed" {
+        match record.error_message.as_deref() {
+            Some(message) if !message.is_empty() => format!("failed: {message}"),
+            _ => status.to_string(),
+        }
+    } else {
+        status.to_string()
+    };
+
+    Cell::new(label).fg(color)
 }

@@ -35,6 +35,15 @@ pub(super) async fn download_inner(
     let client_factory = ClientFactory::new(user_agent.as_deref(), experimental_entropy)?;
     let client = client_factory.client()?;
     let meta = http::probe(&client, &url).await?;
+    send_event(
+        &events,
+        DownloadEvent::Metadata {
+            etag: meta.etag.clone(),
+            last_modified: meta.last_modified.clone(),
+            mime_type: meta.mime_type.clone(),
+            final_url: meta.final_url.clone(),
+        },
+    );
     let speed_limiter = limit.map(SpeedLimiter::new).map(Arc::new);
 
     let output = determine_output(&url, &meta, output, output_dir)?;

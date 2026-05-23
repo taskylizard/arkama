@@ -32,6 +32,7 @@ async fn wait_for_progress(events: &mut mpsc::UnboundedReceiver<DownloadEvent>) 
             .expect("progress event timeout");
         let event = next.expect("download event");
         match event {
+            DownloadEvent::Metadata { .. } => {}
             DownloadEvent::Started { resumed_bytes, .. } => {
                 if resumed_bytes > 0 {
                     return resumed_bytes;

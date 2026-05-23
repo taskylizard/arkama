@@ -163,14 +163,22 @@ mod tests {
         path
     }
 
+    fn http_meta(filename: Option<&str>) -> HttpMeta {
+        HttpMeta {
+            size: None,
+            accept_ranges: false,
+            filename: filename.map(ToString::to_string),
+            etag: None,
+            last_modified: None,
+            mime_type: None,
+            final_url: "https://example.com/file.bin".to_string(),
+        }
+    }
+
     #[test]
     fn test_determine_output_explicit_path() {
         let url = Url::parse("https://example.com/file.bin").expect("url");
-        let meta = HttpMeta {
-            size: None,
-            accept_ranges: false,
-            filename: None,
-        };
+        let meta = http_meta(None);
         let path = PathBuf::from("output.bin");
 
         let resolved = determine_output(&url, &meta, Some(path.clone()), None).expect("output");
@@ -182,11 +190,7 @@ mod tests {
         let dir = temp_dir_path("output-dir");
         fs::create_dir_all(&dir).expect("create temp dir");
         let url = Url::parse("https://example.com/file.bin").expect("url");
-        let meta = HttpMeta {
-            size: None,
-            accept_ranges: false,
-            filename: None,
-        };
+        let meta = http_meta(None);
 
         let result = determine_output(&url, &meta, Some(dir), None);
         assert!(result.is_err());
@@ -195,11 +199,7 @@ mod tests {
     #[test]
     fn test_determine_output_uses_meta_filename() {
         let url = Url::parse("https://example.com/file.bin").expect("url");
-        let meta = HttpMeta {
-            size: None,
-            accept_ranges: false,
-            filename: Some("meta.bin".to_string()),
-        };
+        let meta = http_meta(Some("meta.bin"));
 
         let resolved = determine_output(&url, &meta, None, None).expect("output");
         assert_eq!(resolved, PathBuf::from("meta.bin"));
@@ -208,11 +208,7 @@ mod tests {
     #[test]
     fn test_determine_output_uses_url_path() {
         let url = Url::parse("https://example.com/files/report.csv").expect("url");
-        let meta = HttpMeta {
-            size: None,
-            accept_ranges: false,
-            filename: None,
-        };
+        let meta = http_meta(None);
 
         let resolved = determine_output(&url, &meta, None, None).expect("output");
         assert_eq!(resolved, PathBuf::from("report.csv"));
@@ -221,11 +217,7 @@ mod tests {
     #[test]
     fn test_determine_output_uses_output_dir() {
         let url = Url::parse("https://example.com/files/report.csv").expect("url");
-        let meta = HttpMeta {
-            size: None,
-            accept_ranges: false,
-            filename: None,
-        };
+        let meta = http_meta(None);
         let dir = PathBuf::from("/tmp");
 
         let resolved = determine_output(&url, &meta, None, Some(dir.clone())).expect("output");
@@ -235,11 +227,7 @@ mod tests {
     #[test]
     fn test_determine_output_falls_back_to_default() {
         let url = Url::parse("https://example.com/files/").expect("url");
-        let meta = HttpMeta {
-            size: None,
-            accept_ranges: false,
-            filename: None,
-        };
+        let meta = http_meta(None);
 
         let resolved = determine_output(&url, &meta, None, None).expect("output");
         assert_eq!(resolved, PathBuf::from("download"));
@@ -281,6 +269,10 @@ mod tests {
             url: "http://example.com/file.bin".to_string(),
             output: output.clone(),
             total_size: Some(100),
+            etag: None,
+            last_modified: None,
+            mime_type: None,
+            final_url: None,
             segments: vec![Segment {
                 id: 0,
                 start: 0,

@@ -1,5 +1,8 @@
 use eyre::{Context, Result};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
+};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response, StatusCode};
 use std::time::Duration;
@@ -10,6 +13,10 @@ pub(crate) struct HttpMeta {
     pub(crate) size: Option<u64>,
     pub(crate) accept_ranges: bool,
     pub(crate) filename: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) mime_type: Option<String>,
+    pub(crate) final_url: String,
 }
 
 #[derive(Clone)]
@@ -45,11 +52,16 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
     let mut size = None;
     let mut accept_ranges = false;
     let mut filename = None;
+    let mut etag = None;
+    let mut last_modified = None;
+    let mut mime_type = None;
+    let mut final_url = url.to_string();
 
     let head = client.head(url.clone()).send().await;
     let head = head.ok();
 
     if let Some(resp) = head {
+        final_url = resp.url().to_string();
         let headers = resp.headers();
         if let Some(len) = headers.get(CONTENT_LENGTH)
             && let Ok(len) = len.to_str()
@@ -66,6 +78,9 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
         if let Some(name) = filename_from_headers(headers) {
             filename = Some(name);
         }
+        etag = header_string(headers.get(ETAG));
+        last_modified = header_string(headers.get(LAST_MODIFIED));
+        mime_type = header_string(headers.get(CONTENT_TYPE));
     }
 
     if !accept_ranges {
@@ -81,9 +96,14 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
                     size,
                     accept_ranges: false,
                     filename,
+                    etag,
+                    last_modified,
+                    mime_type,
+                    final_url,
                 });
             }
         };
+        final_url = probe.url().to_string();
         if probe.status() == StatusCode::PARTIAL_CONTENT {
             accept_ranges = true;
         }
@@ -102,12 +122,25 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
         {
             filename = Some(name);
         }
+        if etag.is_none() {
+            etag = header_string(probe.headers().get(ETAG));
+        }
+        if last_modified.is_none() {
+            last_modified = header_string(probe.headers().get(LAST_MODIFIED));
+        }
+        if mime_type.is_none() {
+            mime_type = header_string(probe.headers().get(CONTENT_TYPE));
+        }
     }
 
     Ok(HttpMeta {
         size,
         accept_ranges,
         filename,
+        etag,
+        last_modified,
+        mime_type,
+        final_url,
     })
 }
 
@@ -116,14 +149,19 @@ pub(crate) async fn get_range(
     url: &Url,
     start: u64,
     end: Option<u64>,
+    if_range: Option<&str>,
 ) -> Result<Response> {
     let range = match end {
         Some(end) => format!("bytes={start}-{end}"),
         None => format!("bytes={start}-"),
     };
-    let resp = client
-        .get(url.clone())
-        .header(RANGE, range)
+    let mut request = client.get(url.clone()).header(RANGE, range);
+    if let Some(if_range) = if_range
+        && let Ok(value) = HeaderValue::from_str(if_range)
+    {
+        request = request.header(IF_RANGE, value);
+    }
+    let resp = request
         .send()
         .await
         .context("range request failed")?
@@ -171,6 +209,14 @@ fn total_from_content_range(headers: &reqwest::header::HeaderMap) -> Option<u64>
         return None;
     }
     total.parse().ok()
+}
+
+fn header_string(value: Option<&HeaderValue>) -> Option<String> {
+    let value = value?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 #[cfg(test)]

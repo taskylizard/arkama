@@ -228,6 +228,15 @@ async fn run_single_console(db: &Db, request: DownloadRequest, url: &str) -> Res
                     break;
                 };
                 match event {
+                    DownloadEvent::Metadata { etag, last_modified, mime_type, final_url } => {
+                        db.update_download_metadata(
+                            id,
+                            etag.as_deref(),
+                            last_modified.as_deref(),
+                            mime_type.as_deref(),
+                            &final_url,
+                        )?;
+                    }
                     DownloadEvent::Started { output, total_bytes, resumed_bytes } => {
                         db.update_download_started(id, &output, total_bytes, resumed_bytes)?;
                         let bar = progress::build_progress(total_bytes, &output);
@@ -293,6 +302,23 @@ async fn run_single_json(db: &Db, request: DownloadRequest, url: String) -> Resu
                     break;
                 };
                 match event {
+                    DownloadEvent::Metadata { etag, last_modified, mime_type, final_url } => {
+                        db.update_download_metadata(
+                            id,
+                            etag.as_deref(),
+                            last_modified.as_deref(),
+                            mime_type.as_deref(),
+                            &final_url,
+                        )?;
+                        emit_json(json!({
+                            "event": "metadata",
+                            "url": &url,
+                            "etag": etag,
+                            "last_modified": last_modified,
+                            "mime_type": mime_type,
+                            "final_url": final_url,
+                        }))?;
+                    }
                     DownloadEvent::Started { output, total_bytes, resumed_bytes } => {
                         db.update_download_started(id, &output, total_bytes, resumed_bytes)?;
                         emit_json(json!({

@@ -29,6 +29,11 @@ pub(crate) struct DownloadPlan {
     segments: Vec<Segment>,
     connections: usize,
     segment_size: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    mime_type: Option<String>,
+    final_url: String,
+    if_range: Option<String>,
     experimental_entropy: bool,
     client_factory: ClientFactory,
     speed_limiter: Option<Arc<SpeedLimiter>>,
@@ -76,6 +81,11 @@ impl DownloadPlan {
         } else {
             None
         };
+        let etag = meta.etag.clone();
+        let last_modified = meta.last_modified.clone();
+        let mime_type = meta.mime_type.clone();
+        let final_url = meta.final_url.clone();
+        let if_range = etag.clone().or_else(|| last_modified.clone());
 
         let mut segments = Vec::new();
         let output_exists = output.exists();
@@ -84,6 +94,10 @@ impl DownloadPlan {
             && let Some(state) = resume
             && state.url == url.as_str()
             && state.total_size == total_size
+            && state.etag == etag
+            && state.last_modified == last_modified
+            && state.mime_type == mime_type
+            && state.final_url.as_deref() == Some(final_url.as_str())
             && state.experimental_entropy == experimental_entropy
             && state.segment_size == segment_size
         {
@@ -114,6 +128,11 @@ impl DownloadPlan {
             segments,
             connections,
             segment_size,
+            etag,
+            last_modified,
+            mime_type,
+            final_url,
+            if_range,
             experimental_entropy,
             client_factory,
             speed_limiter,
@@ -170,6 +189,10 @@ impl DownloadPlan {
             url: self.url.to_string(),
             output: self.output.clone(),
             total_size: self.total_size,
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+            mime_type: self.mime_type.clone(),
+            final_url: Some(self.final_url.clone()),
             segments: self.segments.clone(),
             segment_size: self.segment_size,
             experimental_entropy: self.experimental_entropy,
@@ -192,6 +215,7 @@ impl DownloadPlan {
             state: Arc::clone(&state),
             stop_rx,
             slow_tracker: None,
+            if_range: self.if_range.clone(),
             speed_limiter: self.speed_limiter.clone(),
             events: self.events.clone(),
             total_downloaded: Arc::clone(&self.total_downloaded),
@@ -247,6 +271,10 @@ impl DownloadPlan {
             url: self.url.to_string(),
             output: self.output.clone(),
             total_size: self.total_size,
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+            mime_type: self.mime_type.clone(),
+            final_url: Some(self.final_url.clone()),
             segments: Vec::new(),
             segment_size: self.segment_size,
             experimental_entropy: self.experimental_entropy,
@@ -262,6 +290,7 @@ impl DownloadPlan {
         let events = self.events.clone();
         let total_downloaded = Arc::clone(&self.total_downloaded);
         let total_size = self.total_size;
+        let if_range = self.if_range.clone();
         let handle = tokio::spawn(async move {
             let context = DownloadSingleContext {
                 client_factory,
@@ -269,6 +298,7 @@ impl DownloadPlan {
                 output,
                 stop_rx,
                 speed_limiter,
+                if_range,
                 start,
                 accept_ranges,
                 events,
@@ -305,6 +335,10 @@ impl DownloadPlan {
             url: self.url.to_string(),
             output: self.output.clone(),
             total_size: self.total_size,
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+            mime_type: self.mime_type.clone(),
+            final_url: Some(self.final_url.clone()),
             segments: self.segments.clone(),
             segment_size: self.segment_size,
             experimental_entropy: self.experimental_entropy,
@@ -331,6 +365,7 @@ impl DownloadPlan {
             state: Arc::clone(&state),
             stop_rx,
             slow_tracker: Some(Arc::clone(&slow_tracker)),
+            if_range: self.if_range.clone(),
             speed_limiter: self.speed_limiter.clone(),
             events: self.events.clone(),
             total_downloaded: Arc::clone(&self.total_downloaded),

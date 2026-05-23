@@ -145,6 +145,7 @@ dependencies = [
  "directories",
  "eyre",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",

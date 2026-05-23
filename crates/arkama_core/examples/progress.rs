@@ -10,6 +10,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     while let Some(event) = handle.events.recv().await {
         match event {
+            DownloadEvent::Metadata {
+                final_url,
+                mime_type,
+                ..
+            } => {
+                println!("metadata: final_url={final_url}; mime_type={mime_type:?}");
+            }
             DownloadEvent::Started {
                 output,
                 total_bytes,

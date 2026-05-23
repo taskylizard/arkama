@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arkama_core::{DownloadRequest, DownloadSummary};
 use eyre::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::DownloadRecord;
 use crate::paths::db_path;
@@ -56,6 +56,54 @@ impl Db {
             self.conn
                 .execute("ALTER TABLE downloads ADD COLUMN daemon_request TEXT", [])?;
         }
+        if !self.downloads_column_exists("error_message")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN error_message TEXT", [])?;
+        }
+        if !self.downloads_column_exists("queue_name")? {
+            self.conn.execute(
+                "ALTER TABLE downloads ADD COLUMN queue_name TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )?;
+        }
+        if !self.downloads_column_exists("priority")? {
+            self.conn.execute(
+                "ALTER TABLE downloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !self.downloads_column_exists("created_at")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN created_at INTEGER", [])?;
+            self.conn.execute(
+                "UPDATE downloads SET created_at = started_at WHERE created_at IS NULL",
+                [],
+            )?;
+        }
+        if !self.downloads_column_exists("updated_at")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN updated_at INTEGER", [])?;
+            self.conn.execute(
+                "UPDATE downloads SET updated_at = COALESCE(finished_at, started_at) WHERE updated_at IS NULL",
+                [],
+            )?;
+        }
+        if !self.downloads_column_exists("etag")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN etag TEXT", [])?;
+        }
+        if !self.downloads_column_exists("last_modified")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN last_modified TEXT", [])?;
+        }
+        if !self.downloads_column_exists("mime_type")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN mime_type TEXT", [])?;
+        }
+        if !self.downloads_column_exists("final_url")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN final_url TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -104,8 +152,10 @@ impl Db {
     ) -> Result<i64> {
         let now = now_ts();
         self.conn.execute(
-            "INSERT INTO downloads (url, output_path, status, total_bytes, downloaded_bytes, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO downloads (
+                url, output_path, status, total_bytes, downloaded_bytes, started_at,
+                queue_name, priority, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', 0, ?6, ?6)",
             params![
                 url,
                 output_path.display().to_string(),
@@ -132,8 +182,12 @@ impl Db {
                 total_bytes,
                 downloaded_bytes,
                 started_at,
+                queue_name,
+                priority,
+                created_at,
+                updated_at,
                 daemon_request
-             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6)",
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, 'default', 0, ?5, ?5, ?6)",
             params![
                 url,
                 output_path.display().to_string(),
@@ -150,8 +204,8 @@ impl Db {
         let request =
             serde_json::to_string(request).context("failed to serialize daemon request")?;
         self.conn.execute(
-            "UPDATE downloads SET daemon_request = ?1 WHERE id = ?2",
-            params![request, id],
+            "UPDATE downloads SET daemon_request = ?1, updated_at = ?2 WHERE id = ?3",
+            params![request, now_ts(), id],
         )?;
         Ok(())
     }
@@ -166,14 +220,33 @@ impl Db {
         let total_bytes = total_bytes.map(|value| value as i64);
         self.conn.execute(
             "UPDATE downloads
-             SET output_path = ?1, status = 'running', total_bytes = ?2, downloaded_bytes = ?3, finished_at = NULL
-             WHERE id = ?4",
+             SET output_path = ?1, status = 'running', error_message = NULL,
+                 total_bytes = ?2, downloaded_bytes = ?3, finished_at = NULL, updated_at = ?4
+             WHERE id = ?5",
             params![
                 output_path.display().to_string(),
                 total_bytes,
                 downloaded_bytes as i64,
+                now_ts(),
                 id,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_download_metadata(
+        &self,
+        id: i64,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+        mime_type: Option<&str>,
+        final_url: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads
+             SET etag = ?1, last_modified = ?2, mime_type = ?3, final_url = ?4, updated_at = ?5
+             WHERE id = ?6",
+            params![etag, last_modified, mime_type, final_url, now_ts(), id],
         )?;
         Ok(())
     }
@@ -186,8 +259,8 @@ impl Db {
     ) -> Result<()> {
         let total_bytes = total_bytes.map(|value| value as i64);
         self.conn.execute(
-            "UPDATE downloads SET total_bytes = ?1, downloaded_bytes = ?2 WHERE id = ?3",
-            params![total_bytes, downloaded_bytes as i64, id],
+            "UPDATE downloads SET total_bytes = ?1, downloaded_bytes = ?2, updated_at = ?3 WHERE id = ?4",
+            params![total_bytes, downloaded_bytes as i64, now_ts(), id],
         )?;
         Ok(())
     }
@@ -195,8 +268,17 @@ impl Db {
     pub fn update_download_finished(&self, id: i64, summary: &DownloadSummary) -> Result<()> {
         let finished_at = now_ts();
         self.conn.execute(
-            "UPDATE downloads SET status = ?1, total_bytes = ?2, downloaded_bytes = ?3, finished_at = ?4 WHERE id = ?5",
-            params!["finished", summary.total_bytes as i64, summary.downloaded_bytes as i64, finished_at, id],
+            "UPDATE downloads
+             SET status = ?1, error_message = NULL, total_bytes = ?2, downloaded_bytes = ?3,
+                 finished_at = ?4, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                "finished",
+                summary.total_bytes as i64,
+                summary.downloaded_bytes as i64,
+                finished_at,
+                id
+            ],
         )?;
         Ok(())
     }
@@ -204,16 +286,16 @@ impl Db {
     pub fn update_download_failed(&self, id: i64, message: &str) -> Result<()> {
         let finished_at = now_ts();
         self.conn.execute(
-            "UPDATE downloads SET status = ?1, finished_at = ?2 WHERE id = ?3",
-            params![format!("failed: {message}"), finished_at, id],
+            "UPDATE downloads SET status = 'failed', error_message = ?1, finished_at = ?2, updated_at = ?2 WHERE id = ?3",
+            params![message, finished_at, id],
         )?;
         Ok(())
     }
 
     pub fn update_download_paused(&self, id: i64, downloaded_bytes: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE downloads SET status = 'paused', downloaded_bytes = ?1 WHERE id = ?2",
-            params![downloaded_bytes as i64, id],
+            "UPDATE downloads SET status = 'paused', downloaded_bytes = ?1, updated_at = ?2 WHERE id = ?3",
+            params![downloaded_bytes as i64, now_ts(), id],
         )?;
         Ok(())
     }
@@ -221,7 +303,7 @@ impl Db {
     pub fn update_download_cancelled(&self, id: i64) -> Result<()> {
         let finished_at = now_ts();
         self.conn.execute(
-            "UPDATE downloads SET status = 'cancelled', finished_at = ?1 WHERE id = ?2",
+            "UPDATE downloads SET status = 'cancelled', finished_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![finished_at, id],
         )?;
         Ok(())
@@ -229,10 +311,60 @@ impl Db {
 
     pub fn requeue_download(&self, id: i64, downloaded_bytes: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE downloads SET status = 'queued', downloaded_bytes = ?1, finished_at = NULL WHERE id = ?2",
-            params![downloaded_bytes as i64, id],
+            "UPDATE downloads
+             SET status = 'queued', error_message = NULL, downloaded_bytes = ?1,
+                 finished_at = NULL, updated_at = ?2
+             WHERE id = ?3",
+            params![downloaded_bytes as i64, now_ts(), id],
         )?;
         Ok(())
+    }
+
+    pub fn load_download(&self, id: i64) -> Result<Option<DownloadRecord>> {
+        let sql = DOWNLOAD_RECORD_SELECT.to_string() + " WHERE id = ?1";
+        self.conn
+            .query_row(&sql, params![id], map_download_record)
+            .optional()
+            .context("failed to load download")
+    }
+
+    pub fn download_status(&self, id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT status FROM downloads WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to load download status")
+    }
+
+    pub fn mark_queued_paused(&self, id: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE downloads SET status = 'paused', updated_at = ?1 WHERE id = ?2 AND status = 'queued'",
+            params![now_ts(), id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn resume_download(&self, id: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE downloads
+             SET status = 'queued', error_message = NULL, finished_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND status = 'paused' AND daemon_request IS NOT NULL",
+            params![now_ts(), id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn retry_download(&self, id: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE downloads
+             SET status = 'queued', error_message = NULL, finished_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND status IN ('failed', 'cancelled') AND daemon_request IS NOT NULL",
+            params![now_ts(), id],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn delete_download(&self, id: i64) -> Result<()> {
@@ -243,16 +375,16 @@ impl Db {
 
     pub fn normalize_running_to_paused(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE downloads SET status = 'paused' WHERE status = 'running' AND daemon_request IS NULL",
-            [],
+            "UPDATE downloads SET status = 'paused', updated_at = ?1 WHERE status = 'running' AND daemon_request IS NULL",
+            params![now_ts()],
         )?;
         Ok(())
     }
 
     pub fn normalize_queued_to_paused(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE downloads SET status = 'paused' WHERE status = 'queued' AND daemon_request IS NULL",
-            [],
+            "UPDATE downloads SET status = 'paused', updated_at = ?1 WHERE status = 'queued' AND daemon_request IS NULL",
+            params![now_ts()],
         )?;
         Ok(())
     }
@@ -260,9 +392,9 @@ impl Db {
     pub fn recover_daemon_downloads(&self) -> Result<()> {
         self.conn.execute(
             "UPDATE downloads
-             SET status = 'queued', finished_at = NULL
+             SET status = 'queued', finished_at = NULL, updated_at = ?1
              WHERE daemon_request IS NOT NULL AND (status = 'starting' OR status = 'running')",
-            [],
+            params![now_ts()],
         )?;
         Ok(())
     }
@@ -284,8 +416,8 @@ impl Db {
             let request: String = row.get(1)?;
 
             let claimed = self.conn.execute(
-                "UPDATE downloads SET status = 'starting', finished_at = NULL WHERE id = ?1 AND status = 'queued'",
-                params![id],
+                "UPDATE downloads SET status = 'starting', finished_at = NULL, updated_at = ?1 WHERE id = ?2 AND status = 'queued'",
+                params![now_ts(), id],
             )?;
             if claimed == 0 {
                 continue;
@@ -311,16 +443,12 @@ impl Db {
         let mut records = Vec::new();
         let like = format!("%{query}%");
         let mut stmt = if query.is_empty() {
-            self.conn.prepare(
-                "SELECT id, url, output_path, status, total_bytes, downloaded_bytes, started_at, finished_at
-                 FROM downloads ORDER BY id DESC",
-            )?
+            self.conn
+                .prepare(&(DOWNLOAD_RECORD_SELECT.to_string() + " ORDER BY id DESC"))?
         } else {
             self.conn.prepare(
-                "SELECT id, url, output_path, status, total_bytes, downloaded_bytes, started_at, finished_at
-                 FROM downloads
-                 WHERE url LIKE ?1 OR output_path LIKE ?1 OR status LIKE ?1
-                 ORDER BY id DESC",
+                &(DOWNLOAD_RECORD_SELECT.to_string()
+                    + " WHERE url LIKE ?1 OR output_path LIKE ?1 OR status LIKE ?1 OR error_message LIKE ?1 ORDER BY id DESC"),
             )?
         };
 
@@ -331,16 +459,7 @@ impl Db {
         };
 
         while let Some(row) = rows.next()? {
-            let record = DownloadRecord {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                output_path: row.get(2)?,
-                status: row.get(3)?,
-                total_bytes: row.get(4)?,
-                downloaded_bytes: row.get(5)?,
-                started_at: row.get(6)?,
-                finished_at: row.get(7)?,
-            };
+            let record = map_download_record(row)?;
             records.push(record);
         }
 
@@ -349,28 +468,38 @@ impl Db {
 
     pub fn load_downloads_limit(&self, limit: usize) -> Result<Vec<DownloadRecord>> {
         let mut records = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, output_path, status, total_bytes, downloaded_bytes, started_at, finished_at
-             FROM downloads ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&(DOWNLOAD_RECORD_SELECT.to_string() + " ORDER BY id DESC LIMIT ?1"))?;
         let mut rows = stmt.query(params![limit as i64])?;
 
         while let Some(row) = rows.next()? {
-            let record = DownloadRecord {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                output_path: row.get(2)?,
-                status: row.get(3)?,
-                total_bytes: row.get(4)?,
-                downloaded_bytes: row.get(5)?,
-                started_at: row.get(6)?,
-                finished_at: row.get(7)?,
-            };
+            let record = map_download_record(row)?;
             records.push(record);
         }
 
         Ok(records)
     }
+}
+
+const DOWNLOAD_RECORD_SELECT: &str = "SELECT id, url, output_path, status, error_message, queue_name, priority, total_bytes, downloaded_bytes, started_at, finished_at, created_at, updated_at FROM downloads";
+
+fn map_download_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
+    Ok(DownloadRecord {
+        id: row.get(0)?,
+        url: row.get(1)?,
+        output_path: row.get(2)?,
+        status: row.get(3)?,
+        error_message: row.get(4)?,
+        queue_name: row.get(5)?,
+        priority: row.get(6)?,
+        total_bytes: row.get(7)?,
+        downloaded_bytes: row.get(8)?,
+        started_at: row.get(9)?,
+        finished_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
 }
 
 fn queued_output_path(request: &DownloadRequest) -> &Path {

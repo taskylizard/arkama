@@ -84,6 +84,7 @@ pub(crate) struct DownloadSegmentContext {
     pub(crate) state: Arc<TokioMutex<DownloadState>>,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
     pub(crate) slow_tracker: Option<Arc<Mutex<SlowestTracker>>>,
+    pub(crate) if_range: Option<String>,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
     pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
@@ -97,6 +98,7 @@ pub(crate) struct DownloadSingleContext {
     pub(crate) output: PathBuf,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
+    pub(crate) if_range: Option<String>,
     pub(crate) start: u64,
     pub(crate) accept_ranges: bool,
     pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
@@ -115,6 +117,7 @@ pub(crate) async fn download_segment(
         state,
         mut stop_rx,
         slow_tracker,
+        if_range,
         speed_limiter,
         events,
         total_downloaded,
@@ -132,7 +135,8 @@ pub(crate) async fn download_segment(
         }
         let client = client_factory.client()?;
         let started = Instant::now();
-        let response = http::get_range(&client, &url, start, Some(segment.end)).await;
+        let response =
+            http::get_range(&client, &url, start, Some(segment.end), if_range.as_deref()).await;
         let response = match response {
             Ok(resp) => resp,
             Err(err) => {
@@ -277,6 +281,7 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
         output,
         mut stop_rx,
         speed_limiter,
+        if_range,
         start,
         mut accept_ranges,
         events,
@@ -295,7 +300,7 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
         let request_start = offset;
         let client = client_factory.client()?;
         let response = if accept_ranges && request_start > 0 {
-            http::get_range(&client, &url, request_start, None).await
+            http::get_range(&client, &url, request_start, None, if_range.as_deref()).await
         } else {
             http::get_full(&client, &url).await
         };

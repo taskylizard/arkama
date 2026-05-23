@@ -17,6 +17,14 @@ pub(crate) struct DownloadState {
     pub(crate) url: String,
     pub(crate) output: PathBuf,
     pub(crate) total_size: Option<u64>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) etag: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) last_modified: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) mime_type: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) final_url: Option<String>,
     pub(crate) segments: Vec<Segment>,
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) segment_size: Option<u64>,
@@ -68,6 +76,10 @@ pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>)
         &state.url,
         &state.output,
         &state.total_size,
+        &state.etag,
+        &state.last_modified,
+        &state.mime_type,
+        &state.final_url,
         &state.segments,
         &state.segment_size,
         &state.experimental_entropy,

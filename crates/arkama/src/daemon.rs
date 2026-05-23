@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use arkama_core::{
     DownloadControl, DownloadEvent, DownloadRequest, DownloadSummary, start_download_with_handle,
 };
-use arkama_data::{Db, daemon_addr_path, daemon_log_path};
+use arkama_data::{Db, DownloadRecord, daemon_addr_path, daemon_log_path};
 use clap::Subcommand;
 use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -40,12 +40,21 @@ enum DaemonRequest {
     Ping,
     Shutdown,
     Enqueue(QueuedDownloadRequest),
+    List { limit: usize, query: Option<String> },
+    Show { id: i64 },
+    Pause { id: i64 },
+    Resume { id: i64 },
+    Cancel { id: i64 },
+    Retry { id: i64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum DaemonResponse {
     Pong(DaemonStatus),
     Enqueued { id: i64 },
+    Jobs(Vec<DownloadRecord>),
+    Job(DownloadRecord),
+    Ok { message: String },
     ShuttingDown,
     Error { message: String },
 }
@@ -186,6 +195,23 @@ impl DaemonState {
                 let id = self.enqueue(request.into())?;
                 Ok(DaemonResponse::Enqueued { id })
             }
+            DaemonRequest::List { limit, query } => {
+                let jobs = match query {
+                    Some(query) => self.db.load_downloads(&query)?,
+                    None => self.db.load_downloads_limit(limit)?,
+                };
+                Ok(DaemonResponse::Jobs(jobs))
+            }
+            DaemonRequest::Show { id } => {
+                let Some(job) = self.db.load_download(id)? else {
+                    return Err(eyre::eyre!("job {id} not found"));
+                };
+                Ok(DaemonResponse::Job(job))
+            }
+            DaemonRequest::Pause { id } => self.pause_job(id),
+            DaemonRequest::Resume { id } => self.resume_job(id),
+            DaemonRequest::Cancel { id } => self.cancel_job(id),
+            DaemonRequest::Retry { id } => self.retry_job(id),
         }
     }
 
@@ -260,6 +286,77 @@ impl DaemonState {
         Ok(())
     }
 
+    fn pause_job(&mut self, id: i64) -> Result<DaemonResponse> {
+        if let Some(active) = self.active.iter_mut().find(|active| active.id == id) {
+            active.control.pause();
+            self.db
+                .update_download_paused(id, active.downloaded_bytes)?;
+            return Ok(DaemonResponse::Ok {
+                message: format!("paused job {id}"),
+            });
+        }
+
+        if self.db.mark_queued_paused(id)? {
+            return Ok(DaemonResponse::Ok {
+                message: format!("paused job {id}"),
+            });
+        }
+
+        let Some(status) = self.db.download_status(id)? else {
+            return Err(eyre::eyre!("job {id} not found"));
+        };
+        Err(eyre::eyre!("job {id} cannot be paused from {status}"))
+    }
+
+    fn resume_job(&mut self, id: i64) -> Result<DaemonResponse> {
+        if !self.db.resume_download(id)? {
+            let Some(status) = self.db.download_status(id)? else {
+                return Err(eyre::eyre!("job {id} not found"));
+            };
+            return Err(eyre::eyre!("job {id} cannot be resumed from {status}"));
+        }
+        self.schedule()?;
+        Ok(DaemonResponse::Ok {
+            message: format!("resumed job {id}"),
+        })
+    }
+
+    fn cancel_job(&mut self, id: i64) -> Result<DaemonResponse> {
+        if let Some(active) = self.active.iter_mut().find(|active| active.id == id) {
+            active.control.cancel();
+            self.db.update_download_cancelled(id)?;
+            return Ok(DaemonResponse::Ok {
+                message: format!("cancelled job {id}"),
+            });
+        }
+
+        let Some(status) = self.db.download_status(id)? else {
+            return Err(eyre::eyre!("job {id} not found"));
+        };
+        match status.as_str() {
+            "queued" | "paused" | "starting" | "running" => {
+                self.db.update_download_cancelled(id)?;
+                Ok(DaemonResponse::Ok {
+                    message: format!("cancelled job {id}"),
+                })
+            }
+            _ => Err(eyre::eyre!("job {id} cannot be cancelled from {status}")),
+        }
+    }
+
+    fn retry_job(&mut self, id: i64) -> Result<DaemonResponse> {
+        if !self.db.retry_download(id)? {
+            let Some(status) = self.db.download_status(id)? else {
+                return Err(eyre::eyre!("job {id} not found"));
+            };
+            return Err(eyre::eyre!("job {id} cannot be retried from {status}"));
+        }
+        self.schedule()?;
+        Ok(DaemonResponse::Ok {
+            message: format!("retried job {id}"),
+        })
+    }
+
     fn poll_active(&mut self) -> Result<()> {
         let mut finished: Vec<(i64, DownloadSummary)> = Vec::new();
         let mut failed: Vec<(i64, String, u64)> = Vec::new();
@@ -269,6 +366,20 @@ impl DaemonState {
             while processed < 200 {
                 match active.receiver.try_recv() {
                     Ok(event) => match event {
+                        DownloadEvent::Metadata {
+                            etag,
+                            last_modified,
+                            mime_type,
+                            final_url,
+                        } => {
+                            self.db.update_download_metadata(
+                                active.id,
+                                etag.as_deref(),
+                                last_modified.as_deref(),
+                                mime_type.as_deref(),
+                                &final_url,
+                            )?;
+                        }
                         DownloadEvent::Started {
                             output,
                             total_bytes,
@@ -333,9 +444,18 @@ impl DaemonState {
 
         for (id, message, downloaded_bytes) in failed {
             if message == "interrupted" {
-                self.db.requeue_download(id, downloaded_bytes)?;
-            } else {
+                if self.db.download_status(id)?.as_deref() != Some("paused") {
+                    self.db.requeue_download(id, downloaded_bytes)?;
+                }
+            } else if message == "cancelled" {
+                self.db.update_download_cancelled(id)?;
+            } else if !matches!(
+                self.db.download_status(id)?.as_deref(),
+                Some("paused" | "cancelled")
+            ) {
                 self.db.update_download_failed(id, &message)?;
+            } else {
+                let _ = message;
             }
             self.active.retain(|active| active.id != id);
         }
@@ -360,8 +480,47 @@ pub async fn enqueue_download(request: DownloadRequest) -> Result<i64> {
         DaemonResponse::Enqueued { id } if id >= 0 => Ok(id),
         DaemonResponse::Enqueued { .. } => Err(eyre::eyre!("daemon is stopping")),
         DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        DaemonResponse::Pong(_) => Err(eyre::eyre!("unexpected daemon response")),
-        DaemonResponse::ShuttingDown => Err(eyre::eyre!("daemon is shutting down")),
+        _ => Err(eyre::eyre!("unexpected daemon response")),
+    }
+}
+
+pub async fn list_jobs(limit: usize, query: Option<String>) -> Result<Vec<DownloadRecord>> {
+    match send_request(DaemonRequest::List { limit, query }).await? {
+        DaemonResponse::Jobs(jobs) => Ok(jobs),
+        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
+        _ => Err(eyre::eyre!("unexpected daemon response")),
+    }
+}
+
+pub async fn show_job(id: i64) -> Result<DownloadRecord> {
+    match send_request(DaemonRequest::Show { id }).await? {
+        DaemonResponse::Job(job) => Ok(job),
+        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
+        _ => Err(eyre::eyre!("unexpected daemon response")),
+    }
+}
+
+pub async fn pause_job(id: i64) -> Result<String> {
+    job_command(DaemonRequest::Pause { id }).await
+}
+
+pub async fn resume_job(id: i64) -> Result<String> {
+    job_command(DaemonRequest::Resume { id }).await
+}
+
+pub async fn cancel_job(id: i64) -> Result<String> {
+    job_command(DaemonRequest::Cancel { id }).await
+}
+
+pub async fn retry_job(id: i64) -> Result<String> {
+    job_command(DaemonRequest::Retry { id }).await
+}
+
+async fn job_command(request: DaemonRequest) -> Result<String> {
+    match send_request(request).await? {
+        DaemonResponse::Ok { message } => Ok(message),
+        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
+        _ => Err(eyre::eyre!("unexpected daemon response")),
     }
 }
 
@@ -494,8 +653,7 @@ async fn stop_command() -> Result<()> {
             Ok(())
         }
         DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        DaemonResponse::Pong(_) => Err(eyre::eyre!("unexpected daemon response")),
-        DaemonResponse::Enqueued { .. } => Err(eyre::eyre!("unexpected daemon response")),
+        _ => Err(eyre::eyre!("unexpected daemon response")),
     }
 }
 
@@ -504,8 +662,8 @@ async fn status() -> Result<DaemonStatus> {
     match response {
         DaemonResponse::Pong(status) => Ok(status),
         DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        DaemonResponse::Enqueued { .. } => Err(eyre::eyre!("unexpected daemon response")),
         DaemonResponse::ShuttingDown => Err(eyre::eyre!("daemon is shutting down")),
+        _ => Err(eyre::eyre!("unexpected daemon response")),
     }
 }
 

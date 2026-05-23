@@ -12,6 +12,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     while let Some(event) = handle.events.recv().await {
         match event {
+            DownloadEvent::Metadata { .. } => {}
             DownloadEvent::Progress {
                 downloaded_bytes, ..
             } if downloaded_bytes > 0 => {

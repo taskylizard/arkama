@@ -11,7 +11,10 @@ arkama-cli download <url>
 arkama-cli download <url> -o ./file.bin
 arkama-cli download <url> --connections 8
 arkama-cli daemon start
-arkama-cli download <url> --daemon
+arkama-cli add <url>
+arkama-cli list
+arkama-cli pause <job-id>
+arkama-cli resume <job-id>
 ```
 
 You can replace `arkama-cli` with `arkama` in the examples below if you prefer the combined binary.
@@ -32,6 +35,8 @@ CLI-first for now.
 - Experimental connection entropy mode for LACP/ECMP environments.
 - Download history backed by SQLite.
 - Background daemon with local TCP control and persisted queue recovery.
+- Daemon job control: add, list, show, pause, resume, cancel, and retry.
+- Resume validation with ETag/Last-Modified metadata and `If-Range` for range requests.
 - Search across past downloads.
 - Configurable download folder (persisted in app settings).
 - JSON output for automation.
@@ -82,6 +87,18 @@ Manage the background daemon.
 
 Queued daemon jobs are stored in the shared SQLite database, survive daemon restarts, and are
 recovered automatically when the daemon starts again.
+
+### Daemon job commands
+
+These commands operate on the running daemon:
+
+- `arkama-cli add <url>`: add a download job to the daemon.
+- `arkama-cli list [-n <N>] [-q <QUERY>]`: list recent jobs.
+- `arkama-cli show <job-id>`: show job details.
+- `arkama-cli pause <job-id>`: pause an active or queued job.
+- `arkama-cli resume <job-id>`: resume a paused job.
+- `arkama-cli cancel <job-id>`: cancel an active, queued, or paused job.
+- `arkama-cli retry <job-id>`: retry a failed or cancelled daemon job.
 
 ### `arkama-cli history [OPTIONS]`
 

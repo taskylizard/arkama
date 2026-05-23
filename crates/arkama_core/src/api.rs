@@ -240,6 +240,12 @@ impl From<DownloadRequestBuilder> for DownloadRequest {
 /// ```
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
+    Metadata {
+        etag: Option<String>,
+        last_modified: Option<String>,
+        mime_type: Option<String>,
+        final_url: String,
+    },
     Started {
         output: PathBuf,
         total_bytes: Option<u64>,
