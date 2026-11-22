@@ -399,7 +399,11 @@ async fn shutdown_reports_failed_persistence_and_releases_joined_workers() {
     let mut config = FlakyServerConfig::new(data.clone());
     config.chunk_size = 1024;
     config.chunk_delay = Duration::from_millis(8);
-    let source = FlakyServer::spawn(config).await;
+    // Hold the first attempt open while SQLite acquires its schema lock, even on slow CI hosts.
+    config.stall_gets = 1;
+    config.stall_after_bytes = 16_384;
+    config.stall_duration = Duration::from_secs(60);
+    let source = FlakyServer::spawn(config.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("arkama.sqlite");
     let path = dir.path().join("persist.bin");
@@ -430,6 +434,8 @@ async fn shutdown_reports_failed_persistence_and_releases_joined_workers() {
         .execute_batch("DROP TRIGGER reject_status")
         .unwrap();
     drop(connection);
+    config.stall_gets = 0;
+    source.configure(config);
     let mut reopened = Host::open(dir.path(), false).await;
     reopened
         .wait(id, |job| job.record.status == "finished")
