@@ -826,8 +826,17 @@ async fn saturated_observations_and_stalled_diagnostics_do_not_block_completion(
     })
     .await
     .expect("collector must expose its gap after resuming");
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let retained = collector.snapshot();
+    let retained = timeout(Duration::from_secs(5), async {
+        loop {
+            let retained = collector.snapshot();
+            if retained.evicted_samples > 0 {
+                break retained;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("collector must resume sampling and evict old history");
     assert_eq!(retained.history.len(), 2);
     assert!(retained.evicted_samples > 0);
     assert!(retained.process_memory_bytes.is_some());
