@@ -1,194 +1,102 @@
-# arkama
+# Arkama
 
-Very, _very_, _very_, work in progress, proceed with fire!
+[![CI](https://github.com/taskylizard/arkama/actions/workflows/ci.yml/badge.svg?branch=trunk)](https://github.com/taskylizard/arkama/actions/workflows/ci.yml)
 
-Fast, practical download manager. Ships as `arkama-cli` and the combined `arkama` binary.
+A download manager written in Rust, with a reusable HTTP engine, a CLI, and a local background daemon.
 
-## 🧭 Quick start (CLI)
+[CLI guide](docs/cli.md) · [Rust API](crates/arkama_core/README.md) · [Development](docs/development.md)
 
-```bash
-arkama-cli download <url>
-arkama-cli download <url> -o ./file.bin
-arkama-cli download <url> --connections 8
-arkama-cli daemon start
-arkama-cli add <url>
-arkama-cli list
-arkama-cli pause <job-id>
-arkama-cli resume <job-id>
+> [!WARNING]
+> Arkama is in early development. The reliable core milestone has landed, but the full core/server
+> foundation is not complete. The current daemon has no authentication; keep it local and do not
+> expose it to the internet. A release license has not been added yet.
+
+## Getting started
+
+Build and install both binaries from this checkout using stable Rust:
+
+```sh
+git clone https://github.com/taskylizard/arkama.git
+cd arkama
+cargo install --path crates/arkama --locked
 ```
 
-You can replace `arkama-cli` with `arkama` in the examples below if you prefer the combined binary.
+Run a download directly, without a daemon:
 
-## ✨ Features
-
-CLI-first for now.
-
-- HTTP/HTTPS downloads with redirects.
-- Filename inference from `Content-Disposition` or URL path.
-- Resume via HTTP Range.
-- Segmented downloads when size and range support are available (default 4 connections).
-- Falls back to single stream when Range is unavailable.
-- Progress bar with total bytes, speed, and ETA.
-- Retries with exponential backoff on transient failures.
-- Ctrl+C saves state for resume.
-- Optional global speed limit.
-- Experimental connection entropy mode for LACP/ECMP environments.
-- Download history backed by SQLite.
-- Background daemon with local TCP control and persisted queue recovery.
-- Daemon job control: add, list, show, pause, resume, cancel, and retry.
-- Resume validation with ETag/Last-Modified metadata and `If-Range` for range requests.
-- Search across past downloads.
-- Configurable download folder (persisted in app settings).
-- JSON output for automation.
-
-## 🔄 Shared configuration
-
-Both binaries share the same SQLite database for settings and download history:
-
-```bash
-# Set download folder (used by both binaries)
-arkama-cli config set download_dir ~/Downloads
-arkama-cli config set connections 8
-arkama-cli config set speed_limit 2MB
-
-# View current config
-arkama-cli config show
-
-# View download history
-arkama-cli history
-arkama-cli history -n 50
-arkama-cli history -q "example.com"
+```sh
+arkama-cli download https://example.com/file.bin -o ./file.bin
+arkama-cli download https://example.com/file.bin --connections 8 --limit 2MB
 ```
 
-## 🎛️ CLI commands
+`arkama` and `arkama-cli` expose the same commands. Run `arkama-cli --help` for the command list,
+or `arkama-cli download --help` for download options.
 
-### `arkama-cli download [OPTIONS] [URL]`
+## What works today
 
-Download a file from a URL.
+- HTTP/HTTPS downloads, redirects, and filename inference.
+- Segmented transfers when the server supports byte ranges, a known size, and a strong ETag.
+- Validated resume checkpoints, pause/cancel controls, and verified final-file publication.
+- Single-stream fallback when safe segmentation or resume is unavailable.
+- Retry/backoff and an aggregate speed limit across the workers of one download.
+- Terminal progress, silent mode, and JSON events. Progress is sampled at most once per 500 ms, not every chunk.
+- SQLite settings and history, search, sequential links-file input, and shell completions.
+- A local daemon with persisted jobs and add/list/show/pause/resume/cancel/retry commands.
 
-- `-o, --output <PATH>`: output file path.
-- `--links-file <PATH>`: text file with one URL per line (downloads run sequentially).
-- `--connections <N>`: concurrent connections for segmented downloads (defaults to config, otherwise `4`).
-- `--user-agent <UA>`: override HTTP User-Agent.
-- `--limit <BYTES_PER_SEC>`: global speed limit (defaults to config if unset; ex: `2MB`, `500KB`).
-- `--experimental-entropy`: experimental; disables idle pooling, uses 4MB segments, and recycles slow segment connections.
-- `--daemon`: enqueue the download on the local arkama daemon.
-- `--silent`: suppress progress and summary output.
-- `--json`: emit JSON events to stdout for automation.
+The daemon is an existing local tool, not the secure client-facing server planned for the foundation.
+The experimental connection-entropy option is opt-in for bonded LACP/ECMP setups, not a general
+flaky-link optimization. See the [CLI guide](docs/cli.md).
 
-### `arkama-cli daemon <COMMAND>`
+## Resume and completion
 
-Manage the background daemon.
+Unfinished bytes and checkpoints use `<output>.arkama.part` and
+`<output>.arkama.part.arkama.state`. Restart with the same URL, output path, and compatible settings
+to reuse validated progress. Missing, corrupt, legacy, or incompatible checkpoints restart from zero.
+Weak/missing validators, unavailable ranges, and unknown sizes use full streams that restart after interruption.
 
-- `arkama-cli daemon start`: launch the daemon in the background.
-- `arkama-cli daemon run`: run the daemon in the foreground.
-- `arkama-cli daemon status`: show daemon status.
-- `arkama-cli daemon stop`: stop the daemon.
+Existing final files are never treated as proof of completion or silently overwritten. Move old
+final-name partials aside or choose a new output path. The final filename appears only after verified
+coverage and synchronized data; the destination filesystem must support hard links. A reusable,
+zero-byte `<output>.arkama.lock` remains after completion and does not indicate a running job.
 
-Queued daemon jobs are stored in the shared SQLite database, survive daemon restarts, and are
-recovered automatically when the daemon starts again.
+HTTP requests use identity encoding; compressed responses are rejected to avoid ambiguous byte offsets.
+These checks protect resume and transfer integrity, not against a server lying about its bytes or ETag.
+See the [core contract](crates/arkama_core/README.md) for shutdown, durability, and feature limits.
 
-### Daemon job commands
+## Use the Rust core
 
-These commands operate on the running daemon:
+`arkama_core` provides awaited and background downloads without CLI, database, or daemon dependencies.
+The consumer supplies a Tokio runtime and owns signals, tracing, and output. The core enforces
+`#![forbid(unsafe_code)]`; public request, control, event, and result types are exported at the crate root.
 
-- `arkama-cli add <url>`: add a download job to the daemon.
-- `arkama-cli list [-n <N>] [-q <QUERY>]`: list recent jobs.
-- `arkama-cli show <job-id>`: show job details.
-- `arkama-cli pause <job-id>`: pause an active or queued job.
-- `arkama-cli resume <job-id>`: resume a paused job.
-- `arkama-cli cancel <job-id>`: cancel an active, queued, or paused job.
-- `arkama-cli retry <job-id>`: retry a failed or cancelled daemon job.
+Start with the [Rust API guide and examples](crates/arkama_core/README.md). The core supports Rust 1.85;
+use current stable Rust for the whole workspace.
 
-### `arkama-cli history [OPTIONS]`
+## Development
 
-Show download history.
-
-- `-n, --limit <N>`: number of records to show (default 20).
-- `-q, --query <QUERY>`: filter by URL, path, or status.
-
-### `arkama-cli config <COMMAND>`
-
-View or modify configuration.
-
-- `arkama-cli config show`: show all settings.
-- `arkama-cli config get <KEY>`: get a setting value.
-- `arkama-cli config set <KEY> <VALUE>`: set a setting value.
-
-Common keys:
-
-- `download_dir`
-- `connections`
-- `max_concurrent`
-- `speed_limit`
-
-### `arkama <COMMAND>`
-
-The `arkama` binary exposes the same CLI commands as `arkama-cli`.
-
-### Global options
-
-- `--reset-db`: reset the application database.
-
-## 🧪 Experimental entropy mode
-
-`--experimental-entropy` is for bonded network setups that load-balance by hashing the 5‑tuple (LACP/ECMP).
-It pushes connection diversity so traffic spreads across links.
-
-What changes:
-
-- Disables idle pooling so segments prefer fresh connections.
-- Uses fixed 4MB segments across your `--connections` worker count.
-- Recycles slow segment connections for the remaining bytes.
-
-Tradeoffs:
-
-- More connection churn and TCP/TLS handshakes.
-- Slightly higher CPU and latency overhead.
-- Can be slower on small files or servers with strict connection limits.
-
-Resume notes:
-
-- Resume state includes the segment size and entropy mode flag.
-- If you resume without the same entropy setting, arkama starts fresh instead of reusing incompatible state.
-
-Should I use this? Nope.
-
-## 💾 Resume and state
-
-- Unfinished bytes use `<output>.arkama.part`; durable progress uses
-  `<output>.arkama.part.arkama.state`. Resume requires a matching strong ETag and valid checkpoint.
-- Missing/corrupt/legacy checkpoints restart from zero. Existing final output files are refused,
-  never assumed complete or silently overwritten. Move old final-name partials aside or choose a new path.
-- The final name is published only after exact transfer coverage and synchronized file data are checked.
-  Publication requires a destination filesystem with hard-link support.
-- On success, partial/checkpoint files are removed. A reusable zero-byte `<output>.arkama.lock` remains
-  to prevent concurrent writers; its presence does not mean a download is running.
-- Servers without strong validators, ranges, or known sizes use a full stream and restart after interruption.
-  Requests use identity encoding; compressed HTTP responses are explicitly rejected.
-- Ctrl+C is handled by the CLI, not the core library. See the [core API contract](crates/arkama_core/README.md)
-  for controls, feature-dependent resume behavior, and compatibility notes.
-- Downloaded size and speed updates are sampled at most every 500 ms per download rather than
-  every chunk, including JSON progress. The initial update and final result are immediate.
-
-## 📌 Examples
-
-```bash
-# Download files
-arkama-cli download https://example.com/file
-arkama-cli download https://example.com/file -o ./file.bin
-arkama-cli download https://example.com/file --connections 8
-arkama-cli download https://example.com/file --limit 2MB
-arkama-cli download --links-file ./links.txt
-arkama-cli download https://example.com/file --experimental-entropy
-arkama-cli daemon start
-arkama-cli download https://example.com/file --daemon
-arkama-cli download https://example.com/file --silent
-arkama-cli download https://example.com/file --json
-
-# Configuration and history
-arkama-cli config show
-arkama-cli config set download_dir ~/Downloads
-arkama-cli history
-arkama-cli history -n 10 -q "zip"
+```sh
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
 ```
+
+CI runs workspace checks, tests, Clippy, formatting, and release builds on Linux, macOS, and Windows.
+The [development guide](docs/development.md) explains crate boundaries, source organization,
+documentation, and feature/MSRV checks.
+
+## Next milestones
+
+The reliable resume/completion and safe-core API milestone is complete. Progress sampling also landed,
+but does **not** complete bounded diagnostics: an indefinitely stalled reader can still accumulate events.
+
+The remaining foundation work is:
+
+2. Bounded observations and diagnostics on a dedicated thread.
+3. Configurable timeouts, retries, and flaky-link recovery.
+4. One persistent manager shared by server and explicit no-server operation.
+5. A secure single-owner server and bounded, reconnectable client API.
+6. Named queues, shared limits, folder rules, and scheduled download windows.
+7. Credential-safe browser request context and duplicate-safe client handoff.
+8. Combined cross-platform, fault, security, and performance validation for a foundation release.
+
+Browser extensions, desktop/Android clients, video support, and measured acceleration remain later work.
