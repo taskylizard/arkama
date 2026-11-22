@@ -325,7 +325,11 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
     state.peak_bodies.fetch_max(active, Ordering::Relaxed);
     let mut sending = Some(SendingBody(state));
     let mut stall = get_attempt.is_some_and(|attempt| attempt <= config.stall_gets);
-    let mut gate = config.body_gate.clone();
+    // Gate every body for admission tests, or only selected attempts for recovery tests.
+    let mut gate = config
+        .body_gate
+        .clone()
+        .filter(|_| config.stall_gets == 0 || stall);
     while sent < send_limit {
         let chunk_end = (sent + config.chunk_size).min(send_limit);
         // Stop measuring before the final write can wake a new request on another CPU.

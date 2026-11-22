@@ -189,6 +189,8 @@ async fn recovery_preserves_correct_bytes_after_disconnects_and_idle_reads() {
             config.chunk_size = 4096;
             if stall {
                 config.stall_gets = 1;
+                // A finite sleep can end during disk work before the next network read.
+                config.body_gate = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
             } else {
                 config.interrupt_range_gets = 1;
                 config.interrupt_full_gets = 1;
