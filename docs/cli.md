@@ -32,7 +32,8 @@ Use `arkama-cli download --help` for the full argument reference:
 | `--experimental-entropy` | Opt-in connection recycling for LACP/ECMP environments. |
 | `-y, --yes` | Currently a no-op; does not authorize overwrite or change collision behavior. |
 
-The speed cap is shared across the workers of **one download**, not across all active daemon jobs.
+The request speed cap is shared across the workers of **one download**. The manager's additional
+`global_speed_limit` cap is shared across all active jobs; see [download management](management.md).
 JSON progress and terminal updates are sampled at most once per 500 ms. Optional core notifications
 use a bounded buffer and may be dropped under overload; the CLI obtains the exact final result from
 the independent completion handle.
@@ -86,8 +87,8 @@ arkama-cli history -q "example.com"
 - `max_concurrent` controls active daemon jobs; the daemon reads it at startup, so restart it to apply changes.
 - `history -q` searches URL, output path, status, and error text. Query results do not apply the `-n` limit.
 
-Configuration currently stores string values; it is not the validated, live-update management contract
-planned for later milestones. The global `--reset-db` option deletes the settings/history database;
+The offline `config` commands edit string values; use `manage set_setting` for validated live changes.
+Do not edit the store while a manager owns it. The global `--reset-db` option deletes the settings/history database;
 it is not a download-cancel command and does not delete completed files.
 
 ## Local background jobs
@@ -116,7 +117,8 @@ By default, it binds to an available loopback port and writes its address to the
 Queued requests survive daemon restarts; interrupted active requests are requeued on startup.
 Pause/cancel responses acknowledge joined workers and durable state. `pausing`/`cancelling` mean a
 request is still being completed. A transfer that has already published may finish instead.
-Queue names and priority fields exist, but scheduling currently claims queued jobs by insertion order.
+Named queues enforce priority, order and per-queue admission. Shared host/bandwidth caps, folder
+rules, batches and timezone windows use `manage`; see [download management](management.md).
 
 ### Shared manager and no-server operation
 

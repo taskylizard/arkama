@@ -17,7 +17,10 @@ use arkama_data::{Db, default_download_dir};
 use fs2::FileExt;
 use tokio::runtime::Handle;
 
-use crate::{Command, Error, JobSnapshot, ManagerPolicy, Message, Reply, Response, Result, Status};
+use crate::{
+    BatchResult, Collision, Command, Error, FolderRule, JobSnapshot, ManagerPolicy, Message, Queue,
+    Reply, Response, Result, Status, Submission,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Intent {
@@ -27,6 +30,7 @@ enum Intent {
 }
 struct Active {
     request: DownloadRequest,
+    queue: String,
     observation: DownloadObservation,
     control: DownloadControl,
     done: mpsc::Receiver<arkama_core::Result<DownloadSummary>>,
@@ -45,6 +49,8 @@ pub(crate) struct Actor {
     db: Db,
     active: BTreeMap<i64, Active>,
     max_concurrent: usize,
+    queues: BTreeMap<String, Queue>,
+    rules: Vec<FolderRule>,
     revision: u64,
     stopping: bool,
 }
@@ -101,14 +107,58 @@ impl Actor {
             .get_setting("max_concurrent")?
             .unwrap_or_else(|| "3".into());
         validate_setting("max_concurrent", &max_concurrent)?;
+        let host_limit = db
+            .get_setting("max_host_connections")?
+            .unwrap_or_else(|| "8".into());
+        let speed = db.get_setting("global_speed_limit")?.unwrap_or_default();
+        validate_setting("max_host_connections", &host_limit)?;
+        validate_setting("global_speed_limit", &speed)?;
+        let limits = arkama_core::DownloadLimits::default();
+        limits
+            .set_connections_per_host(host_limit.parse().expect("validated host limit"))
+            .map_err(|_| Error::new("invalid", "invalid host connection limit"))?;
+        limits.set_bytes_per_second(if speed.is_empty() {
+            0
+        } else {
+            bytefmt::parse(&speed).expect("validated speed")
+        });
+        let queues: BTreeMap<String, Queue> = match db.get_setting("queues")? {
+            Some(value) => serde_json::from_str(&value)
+                .map_err(|_| Error::new("storage", "invalid persisted queues"))?,
+            None => {
+                let mut queue = Queue::new("default");
+                queue.max_active = 64;
+                [(queue.name.clone(), queue)].into_iter().collect()
+            }
+        };
+        if queues.len() > 32 || !queues.contains_key("default") {
+            return Err(Error::new("storage", "invalid persisted queues"));
+        }
+        for (name, queue) in &queues {
+            queue.validate()?;
+            if name != &queue.name {
+                return Err(Error::new("storage", "queue identity mismatch"));
+            }
+        }
+        let rules: Vec<FolderRule> = db
+            .get_setting("folder_rules")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|_| Error::new("storage", "invalid persisted folder rules"))?
+            .unwrap_or_default();
+        validate_rules(&rules, &policy)?;
         Ok(Self {
             _ownership: ownership,
             runtime,
-            session: DownloadSession::default().destination_policy(policy.destination.clone()),
+            session: DownloadSession::default()
+                .destination_policy(policy.destination.clone())
+                .limits(limits),
             policy,
             db,
             active: BTreeMap::new(),
             max_concurrent: max_concurrent.parse().expect("validated limit"),
+            queues,
+            rules,
             revision: 1,
             stopping: false,
         })
@@ -206,18 +256,83 @@ impl Actor {
                 queued: self.db.count_queued_daemon_downloads()?,
                 revision: self.revision,
             })),
-            Command::Enqueue { mut request } => {
-                validate_request(&request)?;
-                self.policy
-                    .destination
-                    .validate(&url::Url::parse(&request.url).expect("validated URL"))
-                    .map_err(|_| {
-                        Error::new("forbidden", "download destination is not authorized")
-                    })?;
-                self.resolve_output(&mut request, -1)?;
-                let id = self.db.insert_daemon_download(&request)?;
+            Command::Enqueue { request } => self.submit(request.into()),
+            Command::Submit { submission } => self.submit(submission),
+            Command::Batch { submissions } => {
+                let results = submissions
+                    .into_iter()
+                    .map(|submission| match self.submit(submission) {
+                        Ok(Response::Accepted { id }) => BatchResult::Accepted { id },
+                        Err(error) => BatchResult::Rejected { error },
+                        _ => unreachable!("submission response"),
+                    })
+                    .collect();
+                Ok(Response::Batch { results })
+            }
+            Command::Queues => Ok(Response::Queues {
+                queues: self.queues.values().cloned().collect(),
+            }),
+            Command::PutQueue { queue } => {
+                queue.validate()?;
+                if !self.queues.contains_key(&queue.name) && self.queues.len() >= 32 {
+                    return Err(Error::new("invalid", "at most 32 queues"));
+                }
+                let mut queues = self.queues.clone();
+                queues.insert(queue.name.clone(), queue);
+                self.db.set_setting(
+                    "queues",
+                    &serde_json::to_string(&queues).expect("queue JSON"),
+                )?;
+                self.queues = queues;
                 self.revision += 1;
-                Ok(Response::Accepted { id })
+                Ok(Response::Ok)
+            }
+            Command::DeleteQueue { name } => {
+                if name == "default" || self.db.queue_has_pending(&name)? {
+                    return Err(Error::new(
+                        "conflict",
+                        "queue is default or has pending jobs",
+                    ));
+                }
+                let mut queues = self.queues.clone();
+                if queues.remove(&name).is_none() {
+                    return Err(Error::new("not_found", "queue not found"));
+                }
+                self.db.set_setting(
+                    "queues",
+                    &serde_json::to_string(&queues).expect("queue JSON"),
+                )?;
+                self.queues = queues;
+                self.revision += 1;
+                Ok(Response::Ok)
+            }
+            Command::MoveJob {
+                id,
+                queue,
+                priority,
+                position,
+            } => {
+                self.require_status(id, &["queued", "paused", "failed", "cancelled"])?;
+                if !self.queues.contains_key(&queue) || priority.abs_diff(0) > 1_000_000 {
+                    return Err(Error::new("invalid", "unknown queue or invalid priority"));
+                }
+                self.db
+                    .move_queued_download(id, &queue, priority, position)?;
+                self.revision += 1;
+                Ok(Response::Job(Box::new(self.job(id)?)))
+            }
+            Command::Rules => Ok(Response::Rules {
+                rules: self.rules.clone(),
+            }),
+            Command::SetRules { rules } => {
+                validate_rules(&rules, &self.policy)?;
+                self.db.set_setting(
+                    "folder_rules",
+                    &serde_json::to_string(&rules).expect("rule JSON"),
+                )?;
+                self.rules = rules;
+                self.revision += 1;
+                Ok(Response::Ok)
             }
             Command::List {
                 limit,
@@ -321,6 +436,21 @@ impl Actor {
                 if key == "max_concurrent" {
                     self.max_concurrent = value.parse().expect("validated limit");
                 }
+                if key == "max_host_connections" {
+                    self.session
+                        .limits_handle()
+                        .set_connections_per_host(value.parse().expect("validated host limit"))
+                        .map_err(|_| Error::new("invalid", "invalid host connection limit"))?;
+                }
+                if key == "global_speed_limit" {
+                    self.session
+                        .limits_handle()
+                        .set_bytes_per_second(if value.is_empty() {
+                            0
+                        } else {
+                            bytefmt::parse(&value).expect("validated speed")
+                        });
+                }
                 self.revision += 1;
                 Ok(Response::Ok)
             }
@@ -328,6 +458,12 @@ impl Actor {
     }
 
     fn resume(&mut self, id: i64, retry: bool) -> Result<Response> {
+        if !self.queues.contains_key(&self.job(id)?.record.queue_name) {
+            return Err(Error::new(
+                "invalid",
+                "move the job to an existing queue before retrying",
+            ));
+        }
         self.require_status(
             id,
             if retry {
@@ -442,6 +578,23 @@ impl Actor {
             .canonicalize()
             .map_err(|_| Error::new("storage", "cannot resolve output directory"))?
             .join(filename);
+        request.output = Some(output.clone());
+        let occupied = std::fs::symlink_metadata(&output).is_ok()
+            || (id < 0
+                && [".arkama.part", ".arkama.part.arkama.state"]
+                    .iter()
+                    .any(|suffix| {
+                        std::fs::symlink_metadata(
+                            output.with_file_name(format!("{filename}{suffix}")),
+                        )
+                        .is_ok()
+                    }));
+        if occupied {
+            return Err(Error::new(
+                "conflict",
+                "output or unowned partial already exists",
+            ));
+        }
         // The retained lock gives case aliases one filesystem identity, even while queued.
         let lock_path = output.with_file_name(format!("{filename}.arkama.lock"));
         if std::fs::symlink_metadata(&lock_path)
@@ -462,13 +615,110 @@ impl Actor {
         Ok(())
     }
 
+    fn submit(&mut self, submission: Submission) -> Result<Response> {
+        let Submission {
+            mut request,
+            queue,
+            priority,
+            category,
+            collision,
+        } = submission;
+        if !self.queues.contains_key(&queue)
+            || priority.abs_diff(0) > 1_000_000
+            || category
+                .as_ref()
+                .is_some_and(|value| value.len() > 64 || value.chars().any(char::is_control))
+        {
+            return Err(Error::new(
+                "invalid",
+                "unknown queue or invalid submission metadata",
+            ));
+        }
+        validate_request(&request)?;
+        let url = url::Url::parse(&request.url).expect("validated URL");
+        self.policy
+            .destination
+            .validate(&url)
+            .map_err(|_| Error::new("forbidden", "download destination is not authorized"))?;
+        if request.output.is_none() && request.output_dir.is_none() {
+            if let Some(rule) = self.rules.iter().find(|rule| {
+                rule.category
+                    .as_ref()
+                    .is_none_or(|expected| category.as_ref() == Some(expected))
+                    && rule.source_host.as_ref().is_none_or(|host| {
+                        url.host_str()
+                            .is_some_and(|source| source.eq_ignore_ascii_case(host))
+                    })
+            }) {
+                request.output_dir = Some(rule.directory.clone());
+            }
+        }
+        match self.resolve_output(&mut request, -1) {
+            Ok(()) => {}
+            Err(error) if error.code == "conflict" && matches!(collision, Collision::Unique) => {
+                let output = request.output.clone().expect("resolved collision path");
+                let filename = output
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| Error::new("invalid", "invalid filename"))?;
+                let mut found = false;
+                for suffix in 1..=100 {
+                    request.output = Some(output.with_file_name(format!("{filename}.{suffix}")));
+                    match self.resolve_output(&mut request, -1) {
+                        Ok(()) => {
+                            found = true;
+                            break;
+                        }
+                        Err(error) if error.code == "conflict" => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !found {
+                    return Err(Error::new("conflict", "no free collision suffix"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        let id = self.db.insert_queued_download(&request, &queue, priority)?;
+        self.revision += 1;
+        Ok(Response::Accepted { id })
+    }
+
     fn schedule(&mut self) -> Result<()> {
         if self.stopping {
             return Ok(());
         }
         while self.active.len() < self.max_concurrent {
-            let Some((id, mut request)) = self.db.claim_next_daemon_download()? else {
+            let mut selected: Option<(&Queue, i64)> = None;
+            for queue in self.queues.values() {
+                if !queue.eligible()
+                    || self
+                        .active
+                        .values()
+                        .filter(|active| active.queue == queue.name)
+                        .count()
+                        >= queue.max_active
+                {
+                    continue;
+                }
+                if let Some(id) = self.db.queue_candidate(&queue.name, queue.newest_first)? {
+                    if selected.is_none_or(|(chosen, candidate)| {
+                        queue.priority > chosen.priority
+                            || (queue.priority == chosen.priority && id < candidate)
+                    }) {
+                        selected = Some((queue, id));
+                    }
+                }
+            }
+            let Some((queue, _)) = selected else {
                 break;
+            };
+            let queue = queue.clone();
+            let Some((id, mut request)) = self
+                .db
+                .claim_queue_download(&queue.name, queue.newest_first)?
+            else {
+                continue;
             };
             if let Err(error) =
                 validate_request(&request).and_then(|_| self.resolve_output(&mut request, id))
@@ -497,6 +747,7 @@ impl Actor {
                         id,
                         Active {
                             request,
+                            queue: queue.name.clone(),
                             observation: handle.observation,
                             control: handle.control,
                             done,
@@ -662,8 +913,13 @@ pub fn validate_setting(key: &str, value: &str) -> Result<()> {
         "max_concurrent" | "connections" => value
             .parse::<usize>()
             .is_ok_and(|value| (1..=64).contains(&value)),
+        "max_host_connections" => value
+            .parse::<usize>()
+            .is_ok_and(|value| (1..=256).contains(&value)),
         "download_dir" => !value.is_empty() && value.len() <= 4096,
-        "speed_limit" => value.is_empty() || bytefmt::parse(value).is_ok_and(|limit| limit > 0),
+        "speed_limit" | "global_speed_limit" => {
+            value.is_empty() || bytefmt::parse(value).is_ok_and(|limit| limit > 0)
+        }
         _ => false,
     };
     if valid {
@@ -692,4 +948,31 @@ fn validate_request(request: &DownloadRequest) -> Result<()> {
         .recovery
         .validate()
         .map_err(|_| Error::new("invalid", "invalid recovery policy"))
+}
+
+fn validate_rules(rules: &[FolderRule], policy: &ManagerPolicy) -> Result<()> {
+    if rules.len() > 64 {
+        return Err(Error::new("invalid", "at most 64 folder rules"));
+    }
+    for rule in rules {
+        if (rule.category.is_none() && rule.source_host.is_none())
+            || rule.category.as_ref().is_some_and(|value| {
+                value.is_empty() || value.len() > 64 || value.chars().any(char::is_control)
+            })
+            || rule.source_host.as_ref().is_some_and(|host| {
+                host.is_empty()
+                    || host.len() > 253
+                    || url::Url::parse(&format!("https://{host}/"))
+                        .ok()
+                        .is_none_or(|url| {
+                            url.host_str()
+                                .is_none_or(|parsed| !parsed.eq_ignore_ascii_case(host))
+                        })
+            })
+        {
+            return Err(Error::new("invalid", "invalid category/source folder rule"));
+        }
+        policy.directory(&rule.directory)?;
+    }
+    Ok(())
 }

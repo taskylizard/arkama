@@ -42,6 +42,8 @@ or `arkama-cli download --help` for download options.
 - SQLite settings and history, search, sequential links-file input, and shell completions.
 - A persistent manager shared by the local daemon and explicit embedded/no-server use, with joined
   controls, output reservations, live settings, and bounded paginated history.
+- Named queues, priority/order controls, shared host/bandwidth limits, folder rules, batches and
+  timezone-aware download windows. See [download management](docs/management.md).
 
 The daemon exposes a bounded [single-owner HTTP/JSON API](docs/server.md), with safe local defaults.
 The experimental connection-entropy option is opt-in for bonded LACP/ECMP setups, not a general
@@ -87,13 +89,12 @@ documentation, and feature/MSRV checks.
 
 ## Next milestones
 
-The reliability/safe-core API, bounded observations, configurable recovery, shared-manager, and
-secure-server milestones are implemented. See the [manager contract](crates/arkama_manager/README.md).
+The reliability/safe-core API, bounded observations, configurable recovery, shared-manager,
+secure-server and download-management milestones are implemented. See the [manager contract](crates/arkama_manager/README.md).
 Optional diagnostics use a dedicated OS thread; slow observers cannot back up the transfer path.
 
 The remaining foundation work is:
 
-6. Named queues, shared limits, folder rules, and scheduled download windows.
 7. Credential-safe browser request context and duplicate-safe client handoff.
 8. Combined cross-platform, fault, security, and performance validation for a foundation release.
 

@@ -192,9 +192,9 @@ pub(crate) async fn download_segment(
                             if bytes.len() as u64 > segment.end + 1 - offset {
                                 return Err(eyre::eyre!("range body exceeds requested bounds"));
                             }
-                            if let Some(speed_limiter) = speed_limiter.as_ref() {
+                            {
                                 let _throttle = observation.timing(Phase::Throttle);
-                                controlled(&mut stop_rx, async { speed_limiter.throttle(bytes.len() as u64).await; Ok(()) }).await?;
+                                controlled(&mut stop_rx, async { client_factory.limits.throttle(bytes.len() as u64, speed_limiter.as_deref()).await; Ok(()) }).await?;
                             }
                             {
                                 let _disk = observation.timing(Phase::DiskWrite);
@@ -347,9 +347,9 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                             if expected.is_some_and(|total| len > total.saturating_sub(offset)) {
                                 return Err(eyre::eyre!("full response exceeds expected length"));
                             }
-                            if let Some(speed_limiter) = speed_limiter.as_ref() {
+                            {
                                 let _throttle = observation.timing(Phase::Throttle);
-                                controlled(&mut stop_rx, async { speed_limiter.throttle(bytes.len() as u64).await; Ok(()) }).await?;
+                                controlled(&mut stop_rx, async { client_factory.limits.throttle(bytes.len() as u64, speed_limiter.as_deref()).await; Ok(()) }).await?;
                             }
                             {
                                 let _disk = observation.timing(Phase::DiskWrite);

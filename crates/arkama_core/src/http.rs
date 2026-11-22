@@ -3,15 +3,15 @@ use crate::recovery::{RecoveryReason, RetryBudget};
 use eyre::{Context, Result};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{
-    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
-    RETRY_AFTER,
+    ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderValue, IF_RANGE,
+    LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE, REFERER, RETRY_AFTER,
 };
 use reqwest::redirect::Policy;
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -43,7 +43,32 @@ pub(crate) struct ClientFactory {
     base: Client,
     pub(crate) recovery: RecoveryPolicy,
     budget: Arc<RetryBudget>,
+    destination: crate::DestinationPolicy,
+    pub(crate) limits: crate::DownloadLimits,
     pub(crate) origin: String,
+}
+
+/// Admission lasts through the body, including retries, streaming and dropped probe responses.
+pub(crate) struct Response {
+    response: reqwest::Response,
+    permit: crate::limits::ConnectionPermit,
+}
+
+impl std::ops::Deref for Response {
+    type Target = reqwest::Response;
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+impl Response {
+    pub(crate) fn bytes_stream(
+        self,
+    ) -> impl Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Unpin {
+        self.response.bytes_stream().scan(self.permit, |_, chunk| {
+            futures_util::future::ready(Some(chunk))
+        })
+    }
 }
 
 impl ClientFactory {
@@ -51,28 +76,65 @@ impl ClientFactory {
         user_agent: Option<&str>,
         experimental_entropy: bool,
         recovery: RecoveryPolicy,
-        budget: Arc<RetryBudget>,
         url: &Url,
-        destination: crate::DestinationPolicy,
+        session: crate::DownloadSession,
     ) -> Result<Self> {
-        destination.validate(url)?;
-        let base = build_client(user_agent, experimental_entropy, &recovery, destination)?;
+        session.destination.validate(url)?;
+        let base = build_client(
+            user_agent,
+            experimental_entropy,
+            &recovery,
+            session.destination.clone(),
+        )?;
         Ok(Self {
             base,
             recovery,
-            budget,
+            budget: session.budget,
+            destination: session.destination,
+            limits: session.limits,
             origin: url.origin().ascii_serialization(),
         })
     }
 
     async fn send(&self, request: RequestBuilder) -> Result<Response> {
-        tokio::time::timeout(
-            Duration::from_millis(self.recovery.setup_timeout_ms),
-            request.send(),
-        )
-        .await
-        .map_err(|_| HttpFailure::SetupTimeout)?
-        .map_err(|error| error.without_url().into())
+        let mut request = request.build().map_err(|error| error.without_url())?;
+        let mut remaining = Duration::from_millis(self.recovery.setup_timeout_ms);
+        for hop in 0..=10 {
+            self.destination.validate(request.url())?;
+            let permit = self.limits.acquire(request.url()).await;
+            let started = Instant::now();
+            let response = tokio::time::timeout(
+                remaining,
+                self.base
+                    .execute(request.try_clone().expect("GET/HEAD without body")),
+            )
+            .await
+            .map_err(|_| HttpFailure::SetupTimeout)?
+            .map_err(|error| error.without_url())?;
+            remaining = remaining.saturating_sub(started.elapsed());
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(Response { response, permit });
+            }
+            if hop == 10 {
+                return Err(eyre::eyre!("redirect limit exceeded"));
+            }
+            let next = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| response.url().join(value).ok())
+                .ok_or_else(|| eyre::eyre!("missing or invalid redirect destination"))?;
+            self.destination.validate(&next)?;
+            if next.origin() != request.url().origin() {
+                for header in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, REFERER] {
+                    request.headers_mut().remove(header);
+                }
+            }
+            *request.url_mut() = next;
+            drop(response);
+            drop(permit);
+        }
+        unreachable!("bounded redirects")
     }
 
     pub(crate) fn retry_delay(
@@ -231,17 +293,10 @@ fn build_client(
         .no_brotli()
         .no_deflate()
         .no_zstd()
+        .pool_max_idle_per_host(0)
         .redirect(Policy::none());
     builder = destination.configure(builder);
-    builder = builder.redirect(Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 10 {
-            attempt.error("redirect limit exceeded")
-        } else if destination.validate(attempt.url()).is_err() {
-            attempt.error("redirect destination is not allowed")
-        } else {
-            attempt.follow()
-        }
-    }));
+    // Redirects are handled explicitly so every actual host acquires the shared budget.
     if experimental_entropy {
         builder = builder.pool_max_idle_per_host(0);
         builder = builder.pool_idle_timeout(Duration::from_secs(0));

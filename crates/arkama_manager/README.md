@@ -68,7 +68,13 @@ a background download. `daemon run --no-server` owns the manager until host shut
 Settings `max_concurrent` and `connections` accept 1–64; `download_dir` is a nonempty path;
 `speed_limit` is an optional bytefmt per-request default. `max_concurrent` changes future admission
 live without preempting workers. The legacy standalone CLI settings remain an offline store editor;
-use `manage` for live shared settings. Named queues and shared host/bandwidth limits follow separately.
+use `manage` for live shared settings. `max_host_connections` defaults to 8 (1–256); positive
+`global_speed_limit` values share one application-wide cap, and an empty value disables it.
+Both changes apply live and survive restart. Named queues, strict priority/FIFO/LIFO/custom positions,
+category/source folder rules, explicit collision choices and timezone-aware windows use the same
+commands and persistence. Queue pause and window closure prevent starts without preempting active
+jobs. Batches return individual durable acceptance/error results. See [download management](../../docs/management.md)
+for bounds, defaults, precedence and full scheduling semantics.
 
 Server hosts use `Manager::open_with_policy` with immutable authorized roots and destination policy.
 Client requests and live settings cannot weaken those boundaries. Trusted local/embedded hosts may

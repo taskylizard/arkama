@@ -5,6 +5,7 @@ mod destination;
 mod downloader;
 mod error;
 mod http;
+mod limits;
 mod observation;
 mod recovery;
 mod request;
@@ -16,6 +17,7 @@ pub use downloader::{
     DownloadSession, discard_partial, download, start_download, start_download_with_handle,
 };
 pub use error::{Error, Result};
+pub use limits::DownloadLimits;
 pub use observation::{
     Diagnostics, DiagnosticsConfig, DiagnosticsSnapshot, DownloadMetadata, DownloadObservation,
     ObservationSnapshot, SpeedSample,

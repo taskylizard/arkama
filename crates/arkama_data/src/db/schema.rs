@@ -28,6 +28,12 @@ impl Db {
     }
 
     fn migrate_downloads_table(&self) -> Result<()> {
+        if !self.downloads_column_exists("queue_position")? {
+            self.conn.execute(
+                "ALTER TABLE downloads ADD COLUMN queue_position INTEGER",
+                [],
+            )?;
+        }
         if !self.downloads_column_exists("daemon_request")? {
             self.conn
                 .execute("ALTER TABLE downloads ADD COLUMN daemon_request TEXT", [])?;
@@ -117,6 +123,7 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS downloads_output_key ON downloads(output_key)",
             [],
         )?;
+        self.conn.execute("CREATE INDEX IF NOT EXISTS downloads_queue_order ON downloads(queue_name, priority DESC, COALESCE(queue_position, id)) WHERE daemon_request IS NOT NULL AND status = 'queued'", [])?;
         Ok(())
     }
 

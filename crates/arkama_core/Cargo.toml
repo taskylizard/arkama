@@ -23,6 +23,7 @@ rustls-tls = ["reqwest/rustls-tls"]
 native-tls = ["reqwest/native-tls"]
 
 [dependencies]
+bytes = "1"
 eyre.workspace = true
 fastrand = "2"
 fs2 = "0.4"

@@ -100,6 +100,8 @@ struct SharedState {
     head_requests: AtomicUsize,
     full_get_requests: AtomicUsize,
     range_get_requests: AtomicUsize,
+    active_bodies: AtomicUsize,
+    peak_bodies: AtomicUsize,
 }
 
 pub(crate) struct FlakyServer {
@@ -119,6 +121,8 @@ impl FlakyServer {
             head_requests: AtomicUsize::new(0),
             full_get_requests: AtomicUsize::new(0),
             range_get_requests: AtomicUsize::new(0),
+            active_bodies: AtomicUsize::new(0),
+            peak_bodies: AtomicUsize::new(0),
         });
         let task_state = Arc::clone(&state);
         let handle = tokio::spawn(async move {
@@ -154,6 +158,18 @@ impl FlakyServer {
             full_get_requests: self.state.full_get_requests.load(Ordering::Relaxed),
             range_get_requests: self.state.range_get_requests.load(Ordering::Relaxed),
         }
+    }
+
+    #[allow(dead_code)] // The shared fixture is also included by suites without limit scenarios.
+    pub(crate) fn peak_bodies(&self) -> usize {
+        self.state.peak_bodies.load(Ordering::Relaxed)
+    }
+}
+
+struct SendingBody(Arc<SharedState>);
+impl Drop for SendingBody {
+    fn drop(&mut self) {
+        self.0.active_bodies.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -264,9 +280,17 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
     };
 
     let mut sent = 0usize;
+    let active = state.active_bodies.fetch_add(1, Ordering::Relaxed) + 1;
+    state.peak_bodies.fetch_max(active, Ordering::Relaxed);
+    let mut sending = Some(SendingBody(state));
     let mut stall = get_attempt.is_some_and(|attempt| attempt <= config.stall_gets);
     while sent < send_limit {
         let chunk_end = (sent + config.chunk_size).min(send_limit);
+        // Stop measuring before the final write can wake a new request on another CPU.
+        // Long overlapping bodies still expose a prematurely released admission permit.
+        if chunk_end == send_limit {
+            drop(sending.take());
+        }
         stream.write_all(&body[sent..chunk_end]).await?;
         sent = chunk_end;
         if stall && sent >= config.stall_after_bytes && sent < send_limit {

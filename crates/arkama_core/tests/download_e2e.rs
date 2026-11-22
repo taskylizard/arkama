@@ -1078,3 +1078,93 @@ async fn download_segmented_large_payload() {
         run += 1;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_limits_cover_bodies_redirects_bandwidth_and_live_changes() {
+    use arkama_core::{DownloadLimits, DownloadSession};
+    let data = asymmetric_data(65_539);
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 1024;
+    config.chunk_delay = Duration::from_millis(4);
+    let server = FlakyServer::spawn(config).await;
+    let destination = server.url().replace("127.0.0.1", "localhost");
+    let mut redirect_config = FlakyServerConfig::new(Vec::new());
+    redirect_config.redirect = Some(destination.clone());
+    let redirect = FlakyServer::spawn(redirect_config).await;
+    let dir = tempfile::tempdir().unwrap();
+    let limits = DownloadLimits::default();
+    assert!(limits.set_connections_per_host(257).is_err());
+    limits.set_connections_per_host(1).unwrap();
+    let session = DownloadSession::default().limits(limits.clone());
+    let first = session
+        .start(request(destination, dir.path().join("direct.bin"), 4))
+        .unwrap();
+    let second = session
+        .start(request(redirect.url(), dir.path().join("redirect.bin"), 3))
+        .unwrap();
+    let (a, b) = timeout(Duration::from_secs(10), async {
+        tokio::join!(first.join, second.join)
+    })
+    .await
+    .unwrap();
+    a.unwrap().unwrap();
+    b.unwrap().unwrap();
+    assert_eq!(
+        server.peak_bodies(),
+        1,
+        "host admission released before response bodies ended"
+    );
+    assert_downloaded(&dir.path().join("direct.bin"), &data).await;
+    assert_downloaded(&dir.path().join("redirect.bin"), &data).await;
+
+    let source = FlakyServer::spawn(FlakyServerConfig::new(data.clone())).await;
+    limits.set_connections_per_host(8).unwrap();
+    limits.set_bytes_per_second(131_072);
+    let started = std::time::Instant::now();
+    let mut joins = Vec::new();
+    for i in 0..3 {
+        joins.push(
+            session
+                .start(request(
+                    source.url(),
+                    dir.path().join(format!("capped-{i}.bin")),
+                    2,
+                ))
+                .unwrap()
+                .join,
+        );
+    }
+    for join in joins {
+        timeout(Duration::from_secs(10), join)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(1400),
+        "three jobs received three independent caps"
+    );
+    for i in 0..3 {
+        assert_downloaded(&dir.path().join(format!("capped-{i}.bin")), &data).await;
+    }
+
+    limits.set_bytes_per_second(1);
+    let job = session
+        .start(request(source.url(), dir.path().join("live.bin"), 1))
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while job.observation.snapshot().received_bytes == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    limits.set_bytes_per_second(0);
+    timeout(Duration::from_secs(3), job.join)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_downloaded(&dir.path().join("live.bin"), &data).await;
+}

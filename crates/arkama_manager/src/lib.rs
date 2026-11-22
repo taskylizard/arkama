@@ -9,6 +9,7 @@
 mod actor;
 mod model;
 mod policy;
+mod queue;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -22,6 +23,7 @@ use tokio::sync::{oneshot, watch};
 
 pub use model::{Command, JobSnapshot, Response, Status};
 pub use policy::ManagerPolicy;
+pub use queue::{BatchResult, Collision, DownloadWindow, FolderRule, Queue, Submission};
 
 /// Stable error categories for local and transport consumers. Messages never contain requests.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

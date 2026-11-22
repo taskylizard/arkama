@@ -469,3 +469,405 @@ async fn shutdown_reports_failed_persistence_and_releases_joined_workers() {
     assert_eq!(tokio::fs::read(path).await.unwrap(), data);
     reopened.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queues_rules_batches_and_limits_match_across_hosts_and_restart() {
+    use arkama_manager::{BatchResult, Collision, DownloadWindow, FolderRule, Queue, Submission};
+    let data: Vec<u8> = (0..262_151)
+        .map(|i| ((i * 23 + i / 241) % 256) as u8)
+        .collect();
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 1024;
+    config.chunk_delay = Duration::from_millis(8);
+    let source = FlakyServer::spawn(config.clone()).await;
+    for server in [false, true] {
+        source.configure(config.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = Host::open(dir.path(), server, &source.url()).await;
+        host.execute(Command::SetSetting {
+            key: "max_concurrent".into(),
+            value: "1".into(),
+        })
+        .await
+        .unwrap();
+        let mut default = Queue::new("default");
+        default.paused = true;
+        let mut high = Queue::new("high");
+        high.paused = true;
+        high.max_active = 1;
+        high.priority = 4;
+        let mut low = Queue::new("low");
+        low.paused = true;
+        low.max_active = 1;
+        low.priority = -2;
+        for queue in [&default, &high, &low] {
+            host.execute(Command::PutQueue {
+                queue: queue.clone(),
+            })
+            .await
+            .unwrap();
+        }
+        let make = |name: &str, queue: &str, priority: i64| {
+            let mut submission = Submission::from(
+                DownloadRequest::new(source.url())
+                    .output(dir.path().join(format!("out/{name}.bin")))
+                    .connections(2),
+            );
+            submission.queue = queue.into();
+            submission.priority = priority;
+            submission
+        };
+        let a = make("a", "high", 0);
+        let mut unique = a.clone();
+        unique.collision = Collision::Unique;
+        let Response::Batch { results } = host
+            .execute(Command::Batch {
+                submissions: vec![
+                    a.clone(),
+                    make("b", "high", 0),
+                    make("c", "low", 100),
+                    make("invalid", "missing", 0),
+                    a,
+                    unique,
+                ],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("batch response");
+        };
+        let accepted = |i: usize| match &results[i] {
+            BatchResult::Accepted { id } => *id,
+            other => panic!("{other:?}"),
+        };
+        let (a, b, c, d) = (accepted(0), accepted(1), accepted(2), accepted(5));
+        assert!(matches!(&results[3], BatchResult::Rejected { error } if error.code == "invalid"));
+        assert!(matches!(&results[4], BatchResult::Rejected { error } if error.code == "conflict"));
+        assert_eq!(
+            host.job(d).await.record.output_path,
+            dir.path()
+                .join("out/a.bin.1")
+                .canonicalize()
+                .unwrap_or_else(|_| dir
+                    .path()
+                    .join("out")
+                    .canonicalize()
+                    .unwrap()
+                    .join("a.bin.1"))
+                .to_string_lossy()
+        );
+        assert!(
+            host.execute(Command::DeleteQueue {
+                name: "high".into()
+            })
+            .await
+            .is_err()
+        );
+        host.execute(Command::MoveJob {
+            id: b,
+            queue: "high".into(),
+            priority: 5,
+            position: -10,
+        })
+        .await
+        .unwrap();
+        high.paused = false;
+        host.execute(Command::PutQueue {
+            queue: high.clone(),
+        })
+        .await
+        .unwrap();
+        host.wait(b, |job| job.record.downloaded_bytes > 4096).await;
+        assert_eq!(host.job(a).await.record.status, "queued");
+        assert_eq!(
+            host.job(c).await.record.status,
+            "queued",
+            "job priority bypassed queue priority"
+        );
+        assert!(
+            host.execute(Command::MoveJob {
+                id: b,
+                queue: "low".into(),
+                priority: 0,
+                position: 0
+            })
+            .await
+            .is_err()
+        );
+        host.execute(Command::SetSetting {
+            key: "max_concurrent".into(),
+            value: "2".into(),
+        })
+        .await
+        .unwrap();
+        low.paused = false;
+        host.execute(Command::PutQueue { queue: low.clone() })
+            .await
+            .unwrap();
+        host.wait(c, |job| job.record.downloaded_bytes > 4096).await;
+        assert_eq!(
+            host.job(a).await.record.status,
+            "queued",
+            "per-queue active limit ignored"
+        );
+        high.paused = true;
+        host.execute(Command::PutQueue {
+            queue: high.clone(),
+        })
+        .await
+        .unwrap();
+        let closed = DownloadWindow {
+            timezone: "UTC".into(),
+            weekdays: vec![0, 1, 2, 3, 4, 5, 6],
+            start_minute: ((chrono_minute() + 10) % 1440),
+            end_minute: ((chrono_minute() + 11) % 1440),
+        };
+        low.window = Some(closed);
+        host.execute(Command::PutQueue { queue: low.clone() })
+            .await
+            .unwrap();
+        host.wait(b, |job| job.record.status == "finished").await;
+        host.wait(c, |job| job.record.status == "finished").await;
+        assert_eq!(std::fs::read(dir.path().join("out/b.bin")).unwrap(), data);
+        assert_eq!(std::fs::read(dir.path().join("out/c.bin")).unwrap(), data);
+        let Response::Accepted { id: scheduled } = host
+            .execute(Command::Submit {
+                submission: make("scheduled", "low", 0),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("acceptance");
+        };
+        let rules = vec![
+            FolderRule {
+                category: Some("docs".into()),
+                source_host: Some("127.0.0.1".into()),
+                directory: dir.path().join("out/docs"),
+            },
+            FolderRule {
+                category: None,
+                source_host: Some("127.0.0.1".into()),
+                directory: dir.path().join("out/source"),
+            },
+        ];
+        host.execute(Command::SetRules { rules }).await.unwrap();
+        host.execute(Command::SetSetting {
+            key: "download_dir".into(),
+            value: dir
+                .path()
+                .join("out/default")
+                .to_string_lossy()
+                .into_owned(),
+        })
+        .await
+        .unwrap();
+        let mut inferred = Submission::from(DownloadRequest::new(source.url()));
+        inferred.category = Some("docs".into());
+        let Response::Accepted { id: document } = host
+            .execute(Command::Submit {
+                submission: inferred.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("document acceptance");
+        };
+        assert!(Path::new(&host.job(document).await.record.output_path).ends_with("docs/file.bin"));
+        inferred.request.output_dir = Some(dir.path().join("out/explicit"));
+        let Response::Accepted { id: explicit } = host
+            .execute(Command::Submit {
+                submission: inferred,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("explicit acceptance");
+        };
+        assert!(
+            Path::new(&host.job(explicit).await.record.output_path).ends_with("explicit/file.bin")
+        );
+        let Response::Accepted { id: by_source } = host
+            .execute(Command::Enqueue {
+                request: DownloadRequest::new(source.url()),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("source acceptance");
+        };
+        assert!(
+            Path::new(&host.job(by_source).await.record.output_path).ends_with("source/file.bin")
+        );
+        let Response::Accepted { id: fallback } = host
+            .execute(Command::Enqueue {
+                request: DownloadRequest::new("https://example.com/fallback.bin"),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("default folder acceptance");
+        };
+        assert!(
+            Path::new(&host.job(fallback).await.record.output_path)
+                .ends_with("default/fallback.bin")
+        );
+        host.execute(Command::Cancel { id: fallback })
+            .await
+            .unwrap(); // Never fetch an external fixture.
+        assert!(
+            host.execute(Command::Submit {
+                submission: make("c", "default", 0)
+            })
+            .await
+            .is_err()
+        );
+        let mut collision = make("c", "default", 0);
+        collision.collision = Collision::Unique;
+        let Response::Accepted { id: collision } = host
+            .execute(Command::Submit {
+                submission: collision,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unique file acceptance");
+        };
+        assert!(Path::new(&host.job(collision).await.record.output_path).ends_with("c.bin.1"));
+        host.execute(Command::Cancel { id: collision })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dir.path().join("out/c.bin")).unwrap(), data);
+        if server {
+            assert!(
+                host.execute(Command::SetRules {
+                    rules: vec![FolderRule {
+                        category: Some("unsafe".into()),
+                        source_host: None,
+                        directory: dir.path().join("state")
+                    }]
+                })
+                .await
+                .is_err()
+            );
+        }
+        host.execute(Command::SetSetting {
+            key: "max_host_connections".into(),
+            value: "1".into(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            host.execute(Command::SetSetting {
+                key: "global_speed_limit".into(),
+                value: "0".into()
+            })
+            .await
+            .is_err()
+        );
+        host.execute(Command::SetSetting {
+            key: "global_speed_limit".into(),
+            value: "524288".into(),
+        })
+        .await
+        .unwrap();
+        host.stop().await;
+        host = Host::open(dir.path(), server, &source.url()).await;
+        for id in [a, d, scheduled, document, explicit, by_source] {
+            assert_eq!(host.job(id).await.record.status, "queued");
+        }
+        assert_eq!(host.job(b).await.record.status, "finished");
+        let Response::Queues { queues } = host.execute(Command::Queues).await.unwrap() else {
+            panic!("queues");
+        };
+        assert!(
+            queues
+                .iter()
+                .any(|queue| queue.name == "high" && queue.paused)
+        );
+        assert!(
+            queues
+                .iter()
+                .any(|queue| queue.name == "low" && queue.window.is_some())
+        );
+        let Response::Rules { rules } = host.execute(Command::Rules).await.unwrap() else {
+            panic!("rules");
+        };
+        assert_eq!(rules.len(), 2);
+        let Response::Setting { value, .. } = host
+            .execute(Command::GetSetting {
+                key: "max_host_connections".into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("limits");
+        };
+        assert_eq!(value.as_deref(), Some("1"));
+        high.paused = false;
+        high.newest_first = true;
+        host.execute(Command::MoveJob {
+            id: d,
+            queue: "high".into(),
+            priority: 0,
+            position: 100,
+        })
+        .await
+        .unwrap();
+        host.execute(Command::PutQueue { queue: high })
+            .await
+            .unwrap();
+        host.wait(d, |job| job.record.downloaded_bytes > 4096).await;
+        assert_eq!(
+            host.job(a).await.record.status,
+            "queued",
+            "newest-first/custom order ignored"
+        );
+        host.execute(Command::Cancel { id: d }).await.unwrap();
+        host.wait(a, |job| job.record.status == "finished").await;
+        assert_eq!(std::fs::read(dir.path().join("out/a.bin")).unwrap(), data);
+        low.window = None;
+        host.execute(Command::PutQueue { queue: low })
+            .await
+            .unwrap();
+        host.wait(scheduled, |job| job.record.status == "finished")
+            .await;
+        assert_eq!(
+            std::fs::read(dir.path().join("out/scheduled.bin")).unwrap(),
+            data
+        );
+        // Start three ordinary files under one aggregate cap, not one cap per job.
+        source.configure(FlakyServerConfig::new(data.clone()));
+        host.execute(Command::SetSetting {
+            key: "max_host_connections".into(),
+            value: "8".into(),
+        })
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        default.paused = false;
+        host.execute(Command::PutQueue { queue: default })
+            .await
+            .unwrap();
+        for id in [document, explicit, by_source] {
+            host.wait(id, |job| job.record.status == "finished").await;
+            assert_eq!(
+                std::fs::read(host.job(id).await.record.output_path).unwrap(),
+                data
+            );
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(1400),
+            "application cap was not shared"
+        );
+        host.stop().await;
+    }
+}
+
+fn chrono_minute() -> u32 {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    ((seconds / 60) % 1440) as u32
+}

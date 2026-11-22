@@ -9,6 +9,8 @@ description = "Persistent job management shared by Arkama hosts"
 arkama_core = { path = "../arkama_core" }
 arkama_data = { path = "../arkama_data" }
 bytefmt.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10"
 eyre.workspace = true
 fs2 = "0.4"
 serde.workspace = true

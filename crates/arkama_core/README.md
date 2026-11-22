@@ -173,6 +173,26 @@ Use `DownloadRequest::speed_limit(bytes_per_second)` or the builder's `speed_lim
 approximate byte-per-second cap shared by the workers of one download. This is not an
 application-wide cap across multiple jobs.
 
+For a shared application cap, attach one live `DownloadLimits` to a reused session:
+
+```rust
+use arkama_core::{DownloadLimits, DownloadSession};
+let limits = DownloadLimits::default();
+limits.set_connections_per_host(8)?;
+limits.set_bytes_per_second(5_000_000);
+let session = DownloadSession::default().limits(limits.clone());
+// All jobs started with this session share both limits, including redirects and retries.
+limits.set_bytes_per_second(0); // Wake pending throttles and disable the cap.
+# Ok::<(), arkama_core::Error>(())
+```
+
+Zero disables either core limit; connection limits are at most 256. Per-host admission counts active
+HTTP responses across ports/schemes through their body lifetime. Idle pooling is disabled. Lowered
+connection limits let admitted responses drain; waiting for admission is not a network timeout.
+Bandwidth is a file-byte processing budget with bounded buffered bursts, not a wire-traffic meter.
+Per-job and shared caps are reserved concurrently. The [manager](../arkama_manager/README.md)
+persists and applies these controls across its jobs and both interfaces.
+
 ## Recovery policy
 
 Every request has a `RecoveryPolicy`. Omitted fields in persisted JSON use defaults; Rust struct

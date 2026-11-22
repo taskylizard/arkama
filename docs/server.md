@@ -111,8 +111,9 @@ Unknown routes, methods and command fields are refused. Unsupported API versions
 | POST `/v1/legacy` | Compatibility command shapes for the CLI, under exactly the same protections. |
 
 The old raw line-delimited TCP endpoint is removed; clients must upgrade with the server.
-Use `/v1/commands` for new clients. Current capabilities are jobs, controls, settings, paginated
-history/search, diagnostics and updates; queues/rules/batches/limits/schedules arrive separately.
+Use `/v1/commands` for new clients. Current capabilities include jobs, controls, settings, paginated
+history/search, diagnostics, updates, queues, folder rules, batches, shared limits and schedules.
+See [download management](management.md) for these commands and persisted admission semantics.
 
 Commands include `status`, `enqueue`, `list`, `show`, `pause`, `resume`, `cancel`, `retry`,
 `get_setting`, `set_setting`, and `diagnostics`. For example:

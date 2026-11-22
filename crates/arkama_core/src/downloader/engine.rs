@@ -10,7 +10,6 @@ use super::{EventSender, send_event};
 use crate::DownloadObservation;
 use crate::http::{self, ClientFactory};
 use crate::observation::Phase;
-use crate::recovery::RetryBudget;
 use crate::{DownloadEvent, DownloadMetadata, DownloadRequest, DownloadSummary};
 use eyre::{Context, Result};
 use std::sync::Arc;
@@ -25,8 +24,7 @@ pub(super) async fn download_inner(
     _keep_controls_alive: watch::Sender<StopSignal>,
     mut stop_rx: watch::Receiver<StopSignal>,
     observation: DownloadObservation,
-    budget: Arc<RetryBudget>,
-    destination: crate::DestinationPolicy,
+    session: super::DownloadSession,
 ) -> Result<DownloadSummary> {
     let setup = observation.timing(Phase::Setup);
     let DownloadRequest {
@@ -44,9 +42,8 @@ pub(super) async fn download_inner(
         user_agent.as_deref(),
         experimental_entropy,
         recovery,
-        budget,
         &url,
-        destination,
+        session,
     )?;
     let mut attempts = 0;
     let meta = loop {

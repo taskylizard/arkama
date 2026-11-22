@@ -85,6 +85,16 @@ impl Db {
     }
 
     pub fn insert_daemon_download(&self, request: &DownloadRequest) -> Result<i64> {
+        self.insert_queued_download(request, "default", 0)
+    }
+
+    /// Durable acceptance with queue metadata in the same insertion, before acknowledgement.
+    pub fn insert_queued_download(
+        &self,
+        request: &DownloadRequest,
+        queue: &str,
+        priority: i64,
+    ) -> Result<i64> {
         let now = now_ts();
         let output_path = queued_output_path(request);
         let url = request.url.clone();
@@ -105,7 +115,7 @@ impl Db {
                 daemon_request,
                 state_since_ms,
                 output_key
-             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, 'default', 0, ?5, ?5, ?6, ?7, ?8)",
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?9, ?10, ?5, ?5, ?6, ?7, ?8)",
             params![
                 url,
                 output_path.display().to_string(),
@@ -115,6 +125,8 @@ impl Db {
                 request,
                 now_ms(),
                 output_key(output_path),
+                queue,
+                priority,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -324,15 +336,24 @@ impl Db {
     }
 
     pub fn claim_next_daemon_download(&self) -> Result<Option<(i64, DownloadRequest)>> {
+        self.claim_queue_download("default", false)
+    }
+
+    pub fn claim_queue_download(
+        &self,
+        queue: &str,
+        newest_first: bool,
+    ) -> Result<Option<(i64, DownloadRequest)>> {
         loop {
-            let mut stmt = self.conn.prepare(
+            let sql = format!(
                 "SELECT id, daemon_request
                  FROM downloads
-                 WHERE daemon_request IS NOT NULL AND status = 'queued'
-                 ORDER BY id ASC
-                 LIMIT 1",
-            )?;
-            let mut rows = stmt.query([])?;
+                 WHERE daemon_request IS NOT NULL AND status = 'queued' AND queue_name = ?1
+                 ORDER BY priority DESC, COALESCE(queue_position, id) {}, id ASC LIMIT 1",
+                if newest_first { "DESC" } else { "ASC" }
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query([queue])?;
             let Some(row) = rows.next()? else {
                 return Ok(None);
             };
@@ -364,6 +385,30 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    pub fn queue_candidate(&self, queue: &str, newest_first: bool) -> Result<Option<i64>> {
+        let sql = format!("SELECT id FROM downloads WHERE daemon_request IS NOT NULL AND status = 'queued' AND queue_name = ?1
+            ORDER BY priority DESC, COALESCE(queue_position, id) {}, id ASC LIMIT 1", if newest_first { "DESC" } else { "ASC" });
+        self.conn
+            .query_row(&sql, [queue], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn queue_has_pending(&self, queue: &str) -> Result<bool> {
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM downloads WHERE daemon_request IS NOT NULL AND queue_name = ?1 AND status NOT IN ('finished', 'cancelled', 'failed'))", [queue], |row| row.get(0)).map_err(Into::into)
+    }
+
+    pub fn move_queued_download(
+        &self,
+        id: i64,
+        queue: &str,
+        priority: i64,
+        position: i64,
+    ) -> Result<()> {
+        self.conn.execute("UPDATE downloads SET queue_name = ?1, priority = ?2, queue_position = ?3, updated_at = ?4 WHERE id = ?5", params![queue, priority, position, now_ts(), id])?;
+        Ok(())
     }
 
     pub fn load_downloads(&self, query: &str) -> Result<Vec<DownloadRecord>> {
@@ -541,7 +586,7 @@ impl Db {
     }
 }
 
-const DOWNLOAD_RECORD_SELECT: &str = "SELECT id, url, output_path, status, error_message, queue_name, priority, total_bytes, downloaded_bytes, started_at, finished_at, created_at, updated_at, queue_wait_ms, paused_ms, state_since_ms FROM downloads";
+const DOWNLOAD_RECORD_SELECT: &str = "SELECT id, url, output_path, status, error_message, queue_name, priority, total_bytes, downloaded_bytes, started_at, finished_at, created_at, updated_at, queue_wait_ms, paused_ms, state_since_ms, queue_position FROM downloads";
 
 fn map_download_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
     Ok(DownloadRecord {
@@ -561,6 +606,7 @@ fn map_download_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadReco
         queue_wait_ms: row.get(13)?,
         paused_ms: row.get(14)?,
         state_since_ms: row.get(15)?,
+        queue_position: row.get(16)?,
     })
 }
 

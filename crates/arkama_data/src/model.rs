@@ -9,6 +9,8 @@ pub struct DownloadRecord {
     pub error_message: Option<String>,
     pub queue_name: String,
     pub priority: i64,
+    #[serde(default)]
+    pub queue_position: Option<i64>,
     pub total_bytes: Option<i64>,
     pub downloaded_bytes: i64,
     pub started_at: i64,

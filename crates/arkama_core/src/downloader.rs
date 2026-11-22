@@ -19,6 +19,7 @@ mod worker;
 
 pub(crate) use control::StopSignal;
 use engine::download_inner;
+pub(crate) use rate_limit::SpeedLimiter;
 
 /// Discards partial artifacts only while holding output ownership. Never deletes a final file.
 /// Call only for an output owned by the caller; an active attempt or existing final file refuses.
@@ -36,8 +37,9 @@ pub fn discard_partial(output: &std::path::Path) -> Result<()> {
 /// the standalone functions do not share budgets. The host still owns the runtime and lifecycle.
 #[derive(Clone, Default)]
 pub struct DownloadSession {
-    budget: Arc<RetryBudget>,
-    destination: crate::DestinationPolicy,
+    pub(crate) budget: Arc<RetryBudget>,
+    pub(crate) destination: crate::DestinationPolicy,
+    pub(crate) limits: crate::DownloadLimits,
 }
 
 /// Starts a download on a background task.
@@ -90,6 +92,17 @@ pub fn start_download_with_handle(
 }
 
 impl DownloadSession {
+    /// Shares host-owned connection and bandwidth limits across all jobs and retries.
+    pub fn limits(mut self, limits: crate::DownloadLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Returns the shared live controls for this session's limits.
+    pub fn limits_handle(&self) -> &crate::DownloadLimits {
+        &self.limits
+    }
+
     /// Applies host-owned destination restrictions to every request, redirect, and DNS lookup.
     pub fn destination_policy(mut self, policy: crate::DestinationPolicy) -> Self {
         self.destination = policy;
@@ -114,8 +127,7 @@ impl DownloadSession {
             message: "invalid URL".into(),
         })?;
         self.destination.validate(&url)?;
-        let budget = self.budget.clone();
-        let destination = self.destination.clone();
+        let session = self.clone();
         let (tx, rx) = mpsc::channel(8);
         let observation = DownloadObservation::new();
         let task_observation = observation.clone();
@@ -128,8 +140,7 @@ impl DownloadSession {
                 join_stop_tx,
                 stop_rx,
                 task_observation.clone(),
-                budget,
-                destination,
+                session,
             )
             .await
             .map_err(map_download_error);
@@ -177,8 +188,7 @@ pub async fn download(request: DownloadRequest) -> Result<DownloadSummary> {
         stop_tx,
         stop_rx,
         DownloadObservation::new(),
-        Arc::new(RetryBudget::default()),
-        crate::DestinationPolicy::default(),
+        DownloadSession::default(),
     )
     .await
     .map_err(map_download_error)
