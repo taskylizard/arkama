@@ -1,10 +1,10 @@
-use super::control::StopSignal;
+use super::control::{StopSignal, controlled};
 use super::output::ensure_parent_dir;
 use super::rate_limit::SpeedLimiter;
 use super::send_event;
 use super::state::{DownloadState, update_state};
 use crate::api::DownloadEvent;
-use crate::http::{self, ClientFactory};
+use crate::http::{self, ClientFactory, HttpMeta};
 use crate::segment::Segment;
 use eyre::{Context, Result};
 use futures_util::StreamExt;
@@ -12,7 +12,6 @@ use std::cmp::min;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,8 +20,6 @@ use tokio::fs::OpenOptions as AsyncOpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::{Mutex as TokioMutex, mpsc, watch};
 use url::Url;
-
-pub(crate) const STATE_SYNC_BATCH_BYTES: u64 = 84 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct RangeUnsupported;
@@ -84,7 +81,7 @@ pub(crate) struct DownloadSegmentContext {
     pub(crate) state: Arc<TokioMutex<DownloadState>>,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
     pub(crate) slow_tracker: Option<Arc<Mutex<SlowestTracker>>>,
-    pub(crate) if_range: Option<String>,
+    pub(crate) meta: HttpMeta,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
     pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
@@ -98,9 +95,6 @@ pub(crate) struct DownloadSingleContext {
     pub(crate) output: PathBuf,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
-    pub(crate) if_range: Option<String>,
-    pub(crate) start: u64,
-    pub(crate) accept_ranges: bool,
     pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
     pub(crate) total_size: Option<u64>,
@@ -117,7 +111,7 @@ pub(crate) async fn download_segment(
         state,
         mut stop_rx,
         slow_tracker,
-        if_range,
+        meta,
         speed_limiter,
         events,
         total_downloaded,
@@ -135,17 +129,27 @@ pub(crate) async fn download_segment(
         }
         let client = client_factory.client()?;
         let started = Instant::now();
-        let response =
-            http::get_range(&client, &url, start, Some(segment.end), if_range.as_deref()).await;
+        let response = controlled(
+            &mut stop_rx,
+            http::get_range(&client, &url, start, Some(segment.end), meta.strong_etag()),
+        )
+        .await;
         let response = match response {
             Ok(resp) => resp,
             Err(err) => {
+                if err.downcast_ref::<StopSignal>().is_some() {
+                    return Err(err);
+                }
                 attempts += 1;
                 if attempts > 5 {
                     return Err(err);
                 }
                 let backoff = backoff_delay(attempts);
-                tokio::time::sleep(backoff).await;
+                controlled(&mut stop_rx, async {
+                    tokio::time::sleep(backoff).await;
+                    Ok(())
+                })
+                .await?;
                 continue;
             }
         };
@@ -153,6 +157,7 @@ pub(crate) async fn download_segment(
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(eyre::eyre!(RangeUnsupported));
         }
+        http::validate_range(&response, start, segment.end, &meta)?;
 
         let file = AsyncOpenOptions::new()
             .create(true)
@@ -166,31 +171,34 @@ pub(crate) async fn download_segment(
         let mut stream = response.bytes_stream();
 
         let mut recycle = false;
-        let mut pending_state_sync = 0u64;
         loop {
             tokio::select! {
                 _ = stop_rx.changed() => {
                     let stop_signal = *stop_rx.borrow();
                     if stop_signal != StopSignal::None {
-                        if pending_state_sync > 0 {
-                            file.flush().await?;
-                            update_state(&state, &segment).await?;
-                        }
+                        file.flush().await?;
                         return Err(eyre::Report::new(stop_signal));
                     }
                 }
                 next = stream.next() => {
                     match next {
                         Some(Ok(bytes)) => {
+                            if bytes.len() as u64 > segment.end + 1 - offset {
+                                return Err(eyre::eyre!("range body exceeds requested bounds"));
+                            }
                             if let Some(speed_limiter) = speed_limiter.as_ref() {
-                                speed_limiter.throttle(bytes.len() as u64).await;
+                                controlled(&mut stop_rx, async { speed_limiter.throttle(bytes.len() as u64).await; Ok(()) }).await?;
                             }
                             file.seek(SeekFrom::Start(offset)).await?;
                             file.write_all(&bytes).await?;
+                            file.flush().await?;
                             let len = bytes.len() as u64;
                             offset += len;
                             segment.downloaded += len;
-                            pending_state_sync += len;
+                            // Don't checkpoint complete coverage until the exact response ends.
+                            if offset <= segment.end {
+                                update_state(&state, &segment).await?;
+                            }
                             let downloaded = total_downloaded.fetch_add(len, Ordering::Relaxed) + len;
                             send_event(
                                 &events,
@@ -199,11 +207,6 @@ pub(crate) async fn download_segment(
                                     total_bytes: total_size,
                                 },
                             );
-                            if pending_state_sync >= STATE_SYNC_BATCH_BYTES {
-                                file.flush().await?;
-                                update_state(&state, &segment).await?;
-                                pending_state_sync = 0;
-                            }
                             if let Some(slow_tracker) = slow_tracker.as_ref() {
                                 let elapsed = started.elapsed();
                                 if elapsed > Duration::from_secs(1) {
@@ -211,11 +214,7 @@ pub(crate) async fn download_segment(
                                         let tracker = slow_tracker.lock().unwrap();
                                         tracker.should_recycle(elapsed)
                                     };
-                                    if should_recycle {
-                                        if pending_state_sync > 0 {
-                                            file.flush().await?;
-                                            update_state(&state, &segment).await?;
-                                        }
+                                    if should_recycle && offset <= segment.end {
                                         recycle = true;
                                         break;
                                     }
@@ -223,24 +222,23 @@ pub(crate) async fn download_segment(
                             }
                         }
                         Some(Err(err)) => {
-                            if pending_state_sync > 0 {
-                                file.flush().await?;
-                                update_state(&state, &segment).await?;
+                            file.flush().await?;
+                            if offset > segment.end {
+                                let saved = state.lock().await.segments[segment.id].downloaded;
+                                total_downloaded.fetch_sub(segment.downloaded - saved, Ordering::Relaxed);
+                                segment.downloaded = saved;
                             }
                             attempts += 1;
                             if attempts > 5 {
                                 return Err(eyre::eyre!("segment download failed: {err}"));
                             }
                             let backoff = backoff_delay(attempts);
-                            tokio::time::sleep(backoff).await;
+                            controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                             start = segment.start + segment.downloaded;
                             break;
                         }
                         None => {
                             file.flush().await?;
-                            if pending_state_sync > 0 {
-                                update_state(&state, &segment).await?;
-                            }
                             let expected = segment.end.saturating_sub(segment.start) + 1;
                             if segment.downloaded < expected {
                                 attempts += 1;
@@ -248,10 +246,11 @@ pub(crate) async fn download_segment(
                                     return Err(eyre::eyre!("segment ended early"));
                                 }
                                 let backoff = backoff_delay(attempts);
-                                tokio::time::sleep(backoff).await;
+                                controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                                 start = segment.start + segment.downloaded;
                                 break;
                             }
+                            update_state(&state, &segment).await?;
                             if let Some(slow_tracker) = slow_tracker.as_ref() {
                                 let elapsed = started.elapsed();
                                 let mut tracker = slow_tracker.lock().unwrap();
@@ -281,15 +280,11 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
         output,
         mut stop_rx,
         speed_limiter,
-        if_range,
-        start,
-        mut accept_ranges,
         events,
         total_downloaded,
         total_size,
     } = context;
     let mut attempts = 0u32;
-    let mut offset = start;
     ensure_parent_dir(&output)?;
     loop {
         let stop_signal = *stop_rx.borrow();
@@ -297,43 +292,39 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
             return Err(eyre::Report::new(stop_signal));
         }
 
-        let request_start = offset;
         let client = client_factory.client()?;
-        let response = if accept_ranges && request_start > 0 {
-            http::get_range(&client, &url, request_start, None, if_range.as_deref()).await
-        } else {
-            http::get_full(&client, &url).await
-        };
+        let response = controlled(&mut stop_rx, http::get_full(&client, &url)).await;
         let response = match response {
             Ok(resp) => resp,
             Err(err) => {
+                if err.downcast_ref::<StopSignal>().is_some() {
+                    return Err(err);
+                }
                 attempts += 1;
                 if attempts > 5 {
                     return Err(err);
                 }
                 let backoff = backoff_delay(attempts);
-                tokio::time::sleep(backoff).await;
+                controlled(&mut stop_rx, async {
+                    tokio::time::sleep(backoff).await;
+                    Ok(())
+                })
+                .await?;
                 continue;
             }
         };
 
-        if request_start > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            if accept_ranges {
-                let _ = fs::remove_file(&output);
-                offset = 0;
-                total_downloaded.store(0, Ordering::Relaxed);
-                accept_ranges = false;
-                continue;
-            }
-            let _ = fs::remove_file(&output);
-            offset = 0;
-            total_downloaded.store(0, Ordering::Relaxed);
-            continue;
+        http::validate_identity_encoding(&response)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(eyre::eyre!("full download requires status 200"));
         }
+        let expected = response.content_length().or(total_size);
+        let mut offset = 0;
+        total_downloaded.store(0, Ordering::Relaxed);
 
         let file = AsyncOpenOptions::new()
             .create(true)
-            .truncate(false)
+            .truncate(true)
             .write(true)
             .open(&output)
             .await
@@ -353,12 +344,16 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                 next = stream.next() => {
                     match next {
                         Some(Ok(bytes)) => {
+                            let len = bytes.len() as u64;
+                            if expected.is_some_and(|total| len > total.saturating_sub(offset)) {
+                                return Err(eyre::eyre!("full response exceeds expected length"));
+                            }
                             if let Some(speed_limiter) = speed_limiter.as_ref() {
-                                speed_limiter.throttle(bytes.len() as u64).await;
+                                controlled(&mut stop_rx, async { speed_limiter.throttle(bytes.len() as u64).await; Ok(()) }).await?;
                             }
                             file.seek(SeekFrom::Start(offset)).await?;
                             file.write_all(&bytes).await?;
-                            let len = bytes.len() as u64;
+                            file.flush().await?;
                             offset += len;
                             let downloaded = total_downloaded.fetch_add(len, Ordering::Relaxed) + len;
                             send_event(
@@ -375,32 +370,20 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                             if attempts > 5 {
                                 return Err(eyre::eyre!("download failed: {err}"));
                             }
-                            if !accept_ranges {
-                                let _ = fs::remove_file(&output);
-                                offset = 0;
-                                total_downloaded.store(0, Ordering::Relaxed);
-                            }
                             let backoff = backoff_delay(attempts);
-                            tokio::time::sleep(backoff).await;
+                            controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                             break;
                         }
                         None => {
                             file.flush().await?;
-                            let downloaded = offset.saturating_sub(request_start);
-                            if let Some(total) = total_size {
-                                let expected = total.saturating_sub(request_start);
-                                if downloaded < expected {
+                            if let Some(expected) = expected {
+                                if offset != expected {
                                     attempts += 1;
                                     if attempts > 5 {
                                         return Err(eyre::eyre!("download ended early"));
                                     }
-                                    if !accept_ranges {
-                                        let _ = fs::remove_file(&output);
-                                        offset = 0;
-                                        total_downloaded.store(0, Ordering::Relaxed);
-                                    }
                                     let backoff = backoff_delay(attempts);
-                                    tokio::time::sleep(backoff).await;
+                                    controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                                     break;
                                 }
                             }

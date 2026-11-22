@@ -1,5 +1,7 @@
-use super::control::StopSignal;
-use super::output::determine_output;
+use super::control::{StopSignal, controlled};
+use super::output::{
+    determine_output, lock_output, publish_output, remove_if_exists, sidecar_path,
+};
 use super::plan::{DownloadPlan, DownloadPlanConfig};
 use super::rate_limit::SpeedLimiter;
 use super::send_event;
@@ -7,10 +9,9 @@ use super::state::{load_state, state_path};
 use crate::api::{DownloadEvent, DownloadRequest, DownloadSummary};
 use crate::http::{self, ClientFactory};
 use eyre::{Context, Result};
-use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use url::Url;
@@ -18,8 +19,8 @@ use url::Url;
 pub(super) async fn download_inner(
     request: DownloadRequest,
     events: Option<mpsc::UnboundedSender<DownloadEvent>>,
-    stop_tx: watch::Sender<StopSignal>,
-    stop_rx: watch::Receiver<StopSignal>,
+    _keep_controls_alive: watch::Sender<StopSignal>,
+    mut stop_rx: watch::Receiver<StopSignal>,
 ) -> Result<DownloadSummary> {
     let DownloadRequest {
         url,
@@ -30,11 +31,10 @@ pub(super) async fn download_inner(
         limit,
         experimental_entropy,
     } = request;
-
     let url = Url::parse(&url).context("invalid url")?;
     let client_factory = ClientFactory::new(user_agent.as_deref(), experimental_entropy)?;
     let client = client_factory.client()?;
-    let meta = http::probe(&client, &url).await?;
+    let meta = controlled(&mut stop_rx, http::probe(&client, &url)).await?;
     send_event(
         &events,
         DownloadEvent::Metadata {
@@ -44,88 +44,67 @@ pub(super) async fn download_inner(
             final_url: meta.final_url.clone(),
         },
     );
-    let speed_limiter = limit.map(SpeedLimiter::new).map(Arc::new);
-
     let output = determine_output(&url, &meta, output, output_dir)?;
-    let connections = if connections == 0 { 1 } else { connections };
-
-    let state_path = state_path(&output)?;
-    let mut resume_state = None;
-    if state_path.exists() && output.exists() {
-        resume_state = load_state(&state_path).ok();
-    }
-
+    let _ownership = lock_output(&output)?;
+    let partial = sidecar_path(&output, ".arkama.part")?;
+    let checkpoint = state_path(&partial)?;
+    let resume = load_state(&checkpoint).ok();
     let total_downloaded = Arc::new(AtomicU64::new(0));
-    let config = DownloadPlanConfig {
+    let mut plan = DownloadPlan::new(DownloadPlanConfig {
         url,
-        output: output.clone(),
+        output: partial.clone(),
         meta,
-        connections,
-        resume: resume_state,
+        connections: connections.max(1),
+        resume,
         experimental_entropy,
         client_factory,
-        speed_limiter,
+        speed_limiter: limit.map(SpeedLimiter::new).map(Arc::new),
         events: events.clone(),
         total_downloaded: Arc::clone(&total_downloaded),
-        stop_tx,
-        stop_rx,
-    };
-    let mut download = DownloadPlan::new(config)?;
-    let already_downloaded = download.already_downloaded()?;
-    total_downloaded.store(already_downloaded, Ordering::Relaxed);
-
+        stop_rx: stop_rx.clone(),
+    })?;
+    let resumed = plan.already_downloaded();
+    total_downloaded.store(resumed, Ordering::Relaxed);
     send_event(
         &events,
         DownloadEvent::Started {
             output: output.clone(),
-            total_bytes: download.total_size,
-            resumed_bytes: already_downloaded,
+            total_bytes: plan.total_size,
+            resumed_bytes: resumed,
         },
     );
     info!("download started");
-
-    if output.exists()
-        && let Some(total) = download.total_size
-        && already_downloaded >= total
-    {
-        if state_path.exists() {
-            let _ = fs::remove_file(state_path);
-        }
-        let summary = DownloadSummary {
-            output: download.output.clone(),
-            total_bytes: total,
-            downloaded_bytes: total,
-            resumed_bytes: total,
-            elapsed: Duration::from_secs(0),
-        };
-        send_event(
-            &events,
-            DownloadEvent::Finished {
-                summary: summary.clone(),
-            },
-        );
-        info!("download finished");
-        return Ok(summary);
-    }
-
     let started = Instant::now();
-    let result = download.execute().await;
-    let elapsed = started.elapsed();
-
+    let result = plan.execute().await;
+    let signal = *stop_rx.borrow();
+    if signal == StopSignal::Cancel {
+        remove_if_exists(&checkpoint)?;
+        remove_if_exists(&partial)?;
+    }
+    let result = if signal == StopSignal::Cancel || (signal == StopSignal::Pause && result.is_ok())
+    {
+        Err(eyre::Report::new(signal))
+    } else {
+        result
+    };
     match result {
         Ok(()) => {
-            if state_path.exists() {
-                let _ = fs::remove_file(state_path);
+            let written = total_downloaded.load(Ordering::Relaxed);
+            if partial.metadata()?.len() != written
+                || plan.total_size.is_some_and(|total| total != written)
+            {
+                return Err(eyre::eyre!(
+                    "output length does not match verified transfer coverage"
+                ));
             }
-            let meta = fs::metadata(&download.output).with_context(|| {
-                format!("failed to stat output {path:?}", path = &download.output)
-            })?;
+            publish_output(&partial, &output)?;
+            remove_if_exists(&checkpoint)?;
             let summary = DownloadSummary {
-                output: download.output.clone(),
-                total_bytes: meta.len(),
-                downloaded_bytes: meta.len(),
-                resumed_bytes: already_downloaded,
-                elapsed,
+                output,
+                total_bytes: written,
+                downloaded_bytes: written,
+                resumed_bytes: plan.already_downloaded(),
+                elapsed: started.elapsed(),
             };
             send_event(
                 &events,
@@ -137,20 +116,12 @@ pub(super) async fn download_inner(
             Ok(summary)
         }
         Err(err) => {
-            if let Some(stop_signal) = err.downcast_ref::<StopSignal>() {
-                match stop_signal {
-                    StopSignal::None => {}
-                    StopSignal::Pause => {}
-                    StopSignal::Cancel => {
-                        let _ = fs::remove_file(&download.output);
-                        if state_path.exists() {
-                            let _ = fs::remove_file(state_path);
-                        }
-                    }
-                }
-            }
-            let message = err.to_string();
-            send_event(&events, DownloadEvent::Failed { message });
+            send_event(
+                &events,
+                DownloadEvent::Failed {
+                    message: err.to_string(),
+                },
+            );
             warn!("download failed");
             Err(err)
         }

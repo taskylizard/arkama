@@ -1,3 +1,6 @@
+use super::output::sidecar_path;
+#[cfg(feature = "serde")]
+use super::output::sync_parent;
 use crate::segment::Segment;
 #[cfg(feature = "serde")]
 use eyre::Context;
@@ -5,15 +8,17 @@ use eyre::Result;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "serde")]
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{Mutex as TokioMutex, watch};
+use tokio::sync::Mutex as TokioMutex;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DownloadState {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) version: u32,
     pub(crate) url: String,
     pub(crate) output: PathBuf,
     pub(crate) total_size: Option<u64>,
@@ -32,21 +37,27 @@ pub(crate) struct DownloadState {
     pub(crate) experimental_entropy: bool,
 }
 
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    data: String,
+    sha256: String,
+}
+
 pub(crate) fn state_path(output: &Path) -> Result<PathBuf> {
-    let Some(name) = output.file_name() else {
-        return Err(eyre::eyre!("output file name missing"));
-    };
-    let mut name = name.to_os_string();
-    name.push(".arkama.state");
-    Ok(output.with_file_name(name))
+    sidecar_path(output, ".arkama.state")
 }
 
 #[cfg(feature = "serde")]
 pub(crate) fn load_state(path: &Path) -> Result<DownloadState> {
     let data =
         fs::read_to_string(path).with_context(|| format!("failed to read state {path:?}"))?;
-    let state = serde_json::from_str(&data).with_context(|| format!("invalid state {path:?}"))?;
-    Ok(state)
+    let checkpoint: Checkpoint =
+        serde_json::from_str(&data).with_context(|| format!("invalid checkpoint {path:?}"))?;
+    if checkpoint.sha256 != format!("{:x}", Sha256::digest(checkpoint.data.as_bytes())) {
+        return Err(eyre::eyre!("checkpoint integrity check failed"));
+    }
+    serde_json::from_str(&checkpoint.data).with_context(|| format!("invalid state {path:?}"))
 }
 
 #[cfg(not(feature = "serde"))]
@@ -60,12 +71,36 @@ pub(crate) fn load_state(path: &Path) -> Result<DownloadState> {
 #[cfg(feature = "serde")]
 pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>) -> Result<()> {
     let path = state_path(output)?;
-    let state = state.lock().await;
-    let data = serde_json::to_string_pretty(&*state).context("failed to serialize state")?;
-    tokio::fs::write(&path, data)
-        .await
-        .with_context(|| format!("failed to write state {path:?}"))?;
-    Ok(())
+    // Workers publish written progress only after flushing their Tokio file buffers.
+    // Synchronize at least this snapshot's bytes before making it crash-reusable.
+    let snapshot = state.lock().await.clone();
+    let output = output.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::Write;
+        let data = serde_json::to_string(&snapshot).context("failed to serialize state")?;
+        let checkpoint = Checkpoint {
+            sha256: format!("{:x}", Sha256::digest(data.as_bytes())),
+            data,
+        };
+        let data = serde_json::to_vec(&checkpoint).context("failed to serialize checkpoint")?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&output)?
+            .sync_all()?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&data)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&path)
+            .context("failed to replace checkpoint")?;
+        sync_parent(&path)
+    })
+    .await
+    .context("checkpoint task failed")?
 }
 
 #[cfg(not(feature = "serde"))]
@@ -74,6 +109,7 @@ pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>)
     let state = state.lock().await;
     let _ = (
         &state.url,
+        &state.version,
         &state.output,
         &state.total_size,
         &state.etag,
@@ -87,73 +123,11 @@ pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>)
     Ok(())
 }
 
-#[cfg(feature = "serde")]
 pub(crate) async fn update_state(
     state: &TokioMutex<DownloadState>,
     updated: &Segment,
 ) -> Result<()> {
     let mut state = state.lock().await;
-    if let Some(segment) = state.segments.get_mut(updated.id)
-        && segment.id == updated.id
-    {
-        segment.downloaded = updated.downloaded;
-        return Ok(());
-    }
-
-    let mut index = 0usize;
-    while index < state.segments.len() {
-        if state.segments[index].id == updated.id {
-            state.segments[index].downloaded = updated.downloaded;
-            break;
-        }
-        index += 1;
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "serde"))]
-pub(crate) async fn update_state(
-    state: &TokioMutex<DownloadState>,
-    updated: &Segment,
-) -> Result<()> {
-    let _ = state;
-    let _ = (updated.id, updated.start, updated.end, updated.downloaded);
-    Ok(())
-}
-
-#[cfg(feature = "serde")]
-pub(crate) async fn periodic_save(
-    output: PathBuf,
-    state: Arc<TokioMutex<DownloadState>>,
-    mut stop_rx: watch::Receiver<bool>,
-    interval: Duration,
-) -> Result<()> {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    return Ok(());
-                }
-            }
-            _ = ticker.tick() => {
-                save_state(&output, &state).await?;
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "serde"))]
-pub(crate) async fn periodic_save(
-    output: PathBuf,
-    state: Arc<TokioMutex<DownloadState>>,
-    stop_rx: watch::Receiver<bool>,
-    interval: Duration,
-) -> Result<()> {
-    let _ = output;
-    let _ = state;
-    let _ = stop_rx;
-    let _ = interval;
+    state.segments[updated.id].downloaded = updated.downloaded;
     Ok(())
 }

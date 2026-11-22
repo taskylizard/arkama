@@ -156,9 +156,18 @@ Should I use this? Nope.
 
 ## 💾 Resume and state
 
-- If the output file exists, arkama resumes when possible.
-- For segmented downloads, state is stored in `*.arkama.state` next to the output file.
-- On successful completion, the state file is removed.
+- Unfinished bytes use `<output>.arkama.part`; durable progress uses
+  `<output>.arkama.part.arkama.state`. Resume requires a matching strong ETag and valid checkpoint.
+- Missing/corrupt/legacy checkpoints restart from zero. Existing final output files are refused,
+  never assumed complete or silently overwritten. Move old final-name partials aside or choose a new path.
+- The final name is published only after exact transfer coverage and synchronized file data are checked.
+  Publication requires a destination filesystem with hard-link support.
+- On success, partial/checkpoint files are removed. A reusable zero-byte `<output>.arkama.lock` remains
+  to prevent concurrent writers; its presence does not mean a download is running.
+- Servers without strong validators, ranges, or known sizes use a full stream and restart after interruption.
+  Requests use identity encoding; compressed HTTP responses are explicitly rejected.
+- Ctrl+C is handled by the CLI, not the core library. See the [core API contract](crates/arkama_core/README.md)
+  for controls, feature-dependent resume behavior, and compatibility notes.
 
 ## 📌 Examples
 

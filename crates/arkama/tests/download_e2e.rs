@@ -88,14 +88,15 @@ async fn download_single_and_segmented_resume() {
     assert_eq!(summary.total_bytes, data.len() as u64);
     assert_eq!(summary.downloaded_bytes, data.len() as u64);
 
-    let summary = download(req.clone()).await.unwrap();
-    assert_eq!(summary.total_bytes, data.len() as u64);
-    assert_eq!(summary.downloaded_bytes, data.len() as u64);
+    assert!(download(req.clone()).await.is_err());
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), data.as_ref());
+    tokio::fs::remove_file(&path).await.unwrap();
 
-    // Prepare a partial file to simulate resume
+    // Partial bytes without a durable checkpoint must restart, not be trusted.
     let half = data.len() / 2;
-    tokio::fs::write(&path, &data[..half]).await.unwrap();
-    let state_path = PathBuf::from(format!("{}.arkama.state", path.to_string_lossy()));
+    let partial = PathBuf::from(format!("{}.arkama.part", path.to_string_lossy()));
+    tokio::fs::write(&partial, &data[..half]).await.unwrap();
+    let state_path = PathBuf::from(format!("{}.arkama.state", partial.to_string_lossy()));
     if state_path.exists() {
         tokio::fs::remove_file(&state_path).await.unwrap();
     }
@@ -104,6 +105,8 @@ async fn download_single_and_segmented_resume() {
     resume.connections = 4;
     let summary = download(resume).await.unwrap();
     assert_eq!(summary.total_bytes, data.len() as u64);
+    assert_eq!(summary.resumed_bytes, 0);
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), data.as_ref());
 
     server_handle.abort();
     let _ = server_handle.await;

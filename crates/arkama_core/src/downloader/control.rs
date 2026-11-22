@@ -1,11 +1,12 @@
 use super::state::{DownloadState, save_state};
-use eyre::Result;
+use eyre::{Context, Result};
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::{Mutex as TokioMutex, watch};
-use tokio::task::JoinHandle;
+use std::future::Future;
+use std::path::Path;
+use std::time::Duration;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopSignal {
@@ -16,41 +17,72 @@ pub(crate) enum StopSignal {
 
 impl fmt::Display for StopSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StopSignal::None => write!(f, "none"),
-            StopSignal::Pause => write!(f, "interrupted"),
-            StopSignal::Cancel => write!(f, "cancelled"),
-        }
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Pause => "interrupted",
+            Self::Cancel => "cancelled",
+        })
     }
 }
 
 impl Error for StopSignal {}
 
-pub(crate) async fn wait_with_ctrl_c(
-    handles: Vec<JoinHandle<Result<()>>>,
-    state: Arc<TokioMutex<DownloadState>>,
-    output: PathBuf,
-    stop_tx: watch::Sender<StopSignal>,
-) -> Result<()> {
-    let mut handles = handles;
+// Only cancel network/timer futures here. Disk writes must finish before releasing ownership.
+pub(crate) async fn controlled<T>(
+    stop_rx: &mut watch::Receiver<StopSignal>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let signal = *stop_rx.borrow();
+    if signal != StopSignal::None {
+        return Err(eyre::Report::new(signal));
+    }
     tokio::select! {
-        result = wait_all(handles.drain(..)) => result,
-        _ = tokio::signal::ctrl_c() => {
-            let _ = stop_tx.send(StopSignal::Pause);
-            let _ = wait_all(handles.drain(..)).await;
-            save_state(&output, &state).await?;
-            Err(eyre::Report::new(StopSignal::Pause))
-        }
+        result = future => result,
+        _ = stop_rx.changed() => Err(eyre::Report::new(*stop_rx.borrow())),
     }
 }
 
-async fn wait_all(handles: std::vec::Drain<'_, JoinHandle<Result<()>>>) -> Result<()> {
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(eyre::eyre!("task join failed: {err}")),
+pub(crate) async fn wait_workers(
+    workers: &mut JoinSet<Result<()>>,
+    state: &Mutex<DownloadState>,
+    output: &Path,
+    mut controls: watch::Receiver<StopSignal>,
+    worker_stop: watch::Sender<StopSignal>,
+) -> Result<()> {
+    let mut failure = None;
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.tick().await;
+    while !workers.is_empty() {
+        let signal = *controls.borrow();
+        if signal != StopSignal::None {
+            worker_stop.send_replace(signal);
+            failure = Some(eyre::Report::new(signal));
+        }
+        tokio::select! {
+            _ = controls.changed(), if signal == StopSignal::None => {}
+            result = workers.join_next() => {
+                let result = result.expect("nonempty workers").context("worker task failed").and_then(|result| result);
+                if let Err(err) = result {
+                    if failure.is_none() {
+                        failure = Some(err);
+                        worker_stop.send_replace(StopSignal::Pause);
+                    }
+                }
+            }
+            _ = ticker.tick(), if failure.is_none() => {
+                if let Err(err) = save_state(output, state).await {
+                    failure = Some(err);
+                    worker_stop.send_replace(StopSignal::Pause);
+                }
+            }
         }
     }
-    Ok(())
+    let signal = *controls.borrow();
+    if signal != StopSignal::None {
+        return Err(eyre::Report::new(signal));
+    }
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }

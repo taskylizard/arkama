@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use arkama_core::{DownloadEvent, DownloadRequest, DownloadSummary, download, start_download};
+use arkama_core::{DownloadEvent, DownloadRequest, DownloadSummary, start_download};
 use arkama_data::{Db, default_download_dir};
 use eyre::{Context, Result};
 use serde_json::json;
@@ -204,7 +204,17 @@ async fn run_single(
 
 async fn run_single_silent(db: &Db, request: DownloadRequest, url: &str) -> Result<()> {
     let id = db.insert_download(url, Path::new(""))?;
-    match download(request).await {
+    let mut handle = start_download(request)?;
+    drop(handle.events);
+    let result = tokio::select! {
+        result = &mut handle.join => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            handle.control.pause();
+            handle.join.await?
+        }
+    };
+    match result {
         Ok(summary) => {
             db.update_download_finished(id, &summary)?;
         }
@@ -220,12 +230,18 @@ async fn run_single_console(db: &Db, request: DownloadRequest, url: &str) -> Res
     let id = db.insert_download(url, Path::new(""))?;
     let mut handle = start_download(request)?;
     let mut progress = None;
+    let mut events_closed = false;
 
     loop {
         tokio::select! {
-            event = handle.events.recv() => {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                handle.control.pause();
+            }
+            event = handle.events.recv(), if !events_closed => {
                 let Some(event) = event else {
-                    break;
+                    events_closed = true;
+                    continue;
                 };
                 match event {
                     DownloadEvent::Metadata { etag, last_modified, mime_type, final_url } => {
@@ -294,12 +310,18 @@ async fn run_single_json(db: &Db, request: DownloadRequest, url: String) -> Resu
     let id = db.insert_download(&url, Path::new(""))?;
     let mut handle = start_download(request)?;
     let mut finished_emitted = false;
+    let mut events_closed = false;
 
     loop {
         tokio::select! {
-            event = handle.events.recv() => {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                handle.control.pause();
+            }
+            event = handle.events.recv(), if !events_closed => {
                 let Some(event) = event else {
-                    break;
+                    events_closed = true;
+                    continue;
                 };
                 match event {
                     DownloadEvent::Metadata { etag, last_modified, mime_type, final_url } => {

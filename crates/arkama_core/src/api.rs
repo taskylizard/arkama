@@ -274,6 +274,9 @@ pub struct DownloadSummary {
 }
 
 /// Provides the event stream, completion task, and control handle for a background download.
+///
+/// Await `join` to acknowledge completion or shutdown. Dropping the handle detaches the task;
+/// aborting `join` is not a coordinated pause/cancel and must not be used for shutdown.
 pub struct DownloadHandle {
     pub events: mpsc::UnboundedReceiver<DownloadEvent>,
     pub join: JoinHandle<Result<DownloadSummary>>,
@@ -288,8 +291,15 @@ pub struct DownloadControl {
 
 impl DownloadControl {
     /// Pauses the download and keeps resumable state when possible.
+    /// Await the completion task before starting another attempt. Cannot undo cancellation.
     pub fn pause(&self) {
-        let _ = self.stop_tx.send(StopSignal::Pause);
+        self.stop_tx.send_if_modified(|signal| {
+            if *signal == StopSignal::Cancel {
+                return false;
+            }
+            *signal = StopSignal::Pause;
+            true
+        });
     }
 
     /// Cancels the download and removes partial output/state when possible.

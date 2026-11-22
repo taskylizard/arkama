@@ -1,7 +1,7 @@
 use eyre::{Context, Result};
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-    HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
 };
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response, StatusCode};
@@ -17,6 +17,19 @@ pub(crate) struct HttpMeta {
     pub(crate) last_modified: Option<String>,
     pub(crate) mime_type: Option<String>,
     pub(crate) final_url: String,
+}
+
+impl HttpMeta {
+    pub(crate) fn strong_etag(&self) -> Option<&str> {
+        self.etag.as_deref().filter(|tag| {
+            tag.len() >= 2
+                && tag.starts_with('"')
+                && tag.ends_with('"')
+                && tag[1..tag.len() - 1]
+                    .bytes()
+                    .all(|b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80)
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -37,8 +50,15 @@ impl ClientFactory {
 
 fn build_client(user_agent: Option<&str>, experimental_entropy: bool) -> Result<Client> {
     let user_agent = user_agent.unwrap_or("arkama/0.1");
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let mut builder = Client::builder()
         .user_agent(user_agent)
+        .default_headers(headers)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .redirect(Policy::limited(10));
     if experimental_entropy {
         builder = builder.pool_max_idle_per_host(0);
@@ -58,23 +78,15 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
     let mut final_url = url.to_string();
 
     let head = client.head(url.clone()).send().await;
-    let head = head.ok();
+    let head = head.ok().filter(|response| response.status().is_success());
 
     if let Some(resp) = head {
+        validate_identity_encoding(&resp)?;
         final_url = resp.url().to_string();
         let headers = resp.headers();
-        if let Some(len) = headers.get(CONTENT_LENGTH)
-            && let Ok(len) = len.to_str()
-            && let Ok(parsed) = len.parse::<u64>()
-        {
-            size = Some(parsed);
-        }
-        if let Some(ranges) = headers.get(ACCEPT_RANGES)
-            && let Ok(ranges) = ranges.to_str()
-            && ranges.to_ascii_lowercase().contains("bytes")
-        {
-            accept_ranges = true;
-        }
+        size = header_string(headers.get(CONTENT_LENGTH)).and_then(|len| len.parse().ok());
+        accept_ranges = header_string(headers.get(ACCEPT_RANGES))
+            .is_some_and(|ranges| ranges.eq_ignore_ascii_case("bytes"));
         if let Some(name) = filename_from_headers(headers) {
             filename = Some(name);
         }
@@ -103,31 +115,21 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
                 });
             }
         };
+        validate_identity_encoding(&probe)?;
         final_url = probe.url().to_string();
         if probe.status() == StatusCode::PARTIAL_CONTENT {
             accept_ranges = true;
         }
-        if size.is_none() {
-            if let Some(total) = total_from_content_range(probe.headers()) {
-                size = Some(total);
-            } else if let Some(len) = probe.headers().get(CONTENT_LENGTH)
-                && let Ok(len) = len.to_str()
-                && let Ok(parsed) = len.parse::<u64>()
-            {
-                size = Some(parsed);
-            }
+        if probe.status() == StatusCode::PARTIAL_CONTENT {
+            size = total_from_content_range(probe.headers());
+        } else if probe.status() == StatusCode::OK {
+            size = probe.content_length().or(size);
         }
-        if filename.is_none()
-            && let Some(name) = filename_from_headers(probe.headers())
-        {
-            filename = Some(name);
+        if filename.is_none() {
+            filename = filename_from_headers(probe.headers());
         }
-        if etag.is_none() {
-            etag = header_string(probe.headers().get(ETAG));
-        }
-        if last_modified.is_none() {
-            last_modified = header_string(probe.headers().get(LAST_MODIFIED));
-        }
+        etag = header_string(probe.headers().get(ETAG));
+        last_modified = header_string(probe.headers().get(LAST_MODIFIED));
         if mime_type.is_none() {
             mime_type = header_string(probe.headers().get(CONTENT_TYPE));
         }
@@ -156,10 +158,8 @@ pub(crate) async fn get_range(
         None => format!("bytes={start}-"),
     };
     let mut request = client.get(url.clone()).header(RANGE, range);
-    if let Some(if_range) = if_range
-        && let Ok(value) = HeaderValue::from_str(if_range)
-    {
-        request = request.header(IF_RANGE, value);
+    if let Some(if_range) = if_range {
+        request = request.header(IF_RANGE, HeaderValue::from_str(if_range)?);
     }
     let resp = request
         .send()
@@ -179,6 +179,57 @@ pub(crate) async fn get_full(client: &Client, url: &Url) -> Result<Response> {
         .error_for_status()
         .context("response error")?;
     Ok(resp)
+}
+
+pub(crate) fn validate_identity_encoding(response: &Response) -> Result<()> {
+    if let Some(value) = response.headers().get(CONTENT_ENCODING) {
+        if !value.to_str()?.trim().eq_ignore_ascii_case("identity") {
+            return Err(eyre::eyre!(
+                "encoded responses are not supported; requested identity encoding"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_range(
+    response: &Response,
+    start: u64,
+    end: u64,
+    meta: &HttpMeta,
+) -> Result<()> {
+    validate_identity_encoding(response)?;
+    let value = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .ok_or_else(|| eyre::eyre!("missing Content-Range"))?
+        .to_str()?;
+    let (range, total) = value
+        .strip_prefix("bytes ")
+        .and_then(|value| value.split_once('/'))
+        .ok_or_else(|| eyre::eyre!("invalid Content-Range"))?;
+    let (returned_start, returned_end) = range
+        .split_once('-')
+        .ok_or_else(|| eyre::eyre!("invalid Content-Range bounds"))?;
+    if returned_start.parse::<u64>()? != start
+        || returned_end.parse::<u64>()? != end
+        || Some(total.parse::<u64>()?) != meta.size
+        || response
+            .content_length()
+            .is_some_and(|len| len != end - start + 1)
+    {
+        return Err(eyre::eyre!(
+            "response range does not match requested bounds and total"
+        ));
+    }
+    if response.url().as_str() != meta.final_url
+        || header_string(response.headers().get(ETAG)).as_deref() != meta.strong_etag()
+    {
+        return Err(eyre::eyre!(
+            "resource identity changed during ranged download"
+        ));
+    }
+    Ok(())
 }
 
 fn filename_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {

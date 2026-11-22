@@ -140,17 +140,19 @@ fn send_event(events: &Option<mpsc::UnboundedSender<DownloadEvent>>, event: Down
 mod tests {
     use super::output::determine_output;
     use super::send_event;
-    use super::state::{DownloadState, load_state, periodic_save};
+    #[cfg(feature = "serde")]
+    use super::state::{DownloadState, load_state, save_state};
     use super::worker::backoff_delay;
     use crate::api::DownloadEvent;
     use crate::http::HttpMeta;
+    #[cfg(feature = "serde")]
     use crate::segment::Segment;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    #[cfg(feature = "serde")]
     use tokio::sync::Mutex as TokioMutex;
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::mpsc;
     use url::Url;
 
     fn temp_dir_path(name: &str) -> PathBuf {
@@ -260,12 +262,15 @@ mod tests {
         assert_eq!(message, "boom");
     }
 
+    #[cfg(feature = "serde")]
     #[tokio::test]
-    async fn test_periodic_save_writes_state() {
+    async fn test_save_writes_state() {
         let dir = temp_dir_path("periodic-save");
         fs::create_dir_all(&dir).expect("create temp dir");
         let output = dir.join("file.bin");
+        fs::write(&output, [0; 100]).expect("create output");
         let state = DownloadState {
+            version: 1,
             url: "http://example.com/file.bin".to_string(),
             output: output.clone(),
             total_size: Some(100),
@@ -282,18 +287,8 @@ mod tests {
             segment_size: None,
             experimental_entropy: false,
         };
-        let state = Arc::new(TokioMutex::new(state));
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let handle = tokio::spawn(periodic_save(
-            output.clone(),
-            Arc::clone(&state),
-            stop_rx,
-            Duration::from_millis(20),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let _ = stop_tx.send(true);
-        handle.await.expect("save task").expect("save ok");
+        let state = TokioMutex::new(state);
+        save_state(&output, &state).await.expect("save ok");
 
         let state_path = output.with_file_name("file.bin.arkama.state");
         let saved = load_state(&state_path).expect("load state");

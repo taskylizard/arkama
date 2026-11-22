@@ -1,7 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,10 +17,22 @@ pub(crate) struct FlakyServerConfig {
     pub(crate) interrupt_full_gets: usize,
     pub(crate) interrupt_range_gets: usize,
     pub(crate) interrupt_after_bytes: usize,
+    pub(crate) range_header: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) get_etag: Option<String>,
+    pub(crate) omit_length: bool,
+    pub(crate) ignore_ranges: bool,
+    pub(crate) encoding: Option<String>,
+    pub(crate) extra_range_bytes: usize,
+    pub(crate) header_delay: Duration,
+    pub(crate) range_header_start: Option<u64>,
 }
 
 impl FlakyServerConfig {
     pub(crate) fn new(data: Vec<u8>) -> Self {
+        let fingerprint = data.iter().fold(0u64, |hash, byte| {
+            hash.wrapping_mul(31).wrapping_add(u64::from(*byte))
+        });
         Self {
             data,
             accept_ranges: true,
@@ -29,6 +41,15 @@ impl FlakyServerConfig {
             interrupt_full_gets: 0,
             interrupt_range_gets: 0,
             interrupt_after_bytes: 0,
+            range_header: None,
+            etag: Some(format!("\"{fingerprint:x}\"")),
+            get_etag: None,
+            omit_length: false,
+            ignore_ranges: false,
+            encoding: None,
+            extra_range_bytes: 0,
+            header_delay: Duration::ZERO,
+            range_header_start: None,
         }
     }
 }
@@ -59,7 +80,7 @@ pub(crate) struct RequestStats {
 }
 
 struct SharedState {
-    config: FlakyServerConfig,
+    config: RwLock<FlakyServerConfig>,
     head_requests: AtomicUsize,
     full_get_requests: AtomicUsize,
     range_get_requests: AtomicUsize,
@@ -78,7 +99,7 @@ impl FlakyServer {
             .expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
         let state = Arc::new(SharedState {
-            config,
+            config: RwLock::new(config),
             head_requests: AtomicUsize::new(0),
             full_get_requests: AtomicUsize::new(0),
             range_get_requests: AtomicUsize::new(0),
@@ -105,6 +126,10 @@ impl FlakyServer {
 
     pub(crate) fn url(&self) -> String {
         format!("http://{}/file.bin", self.addr)
+    }
+
+    pub(crate) fn configure(&self, config: FlakyServerConfig) {
+        *self.state.config.write().unwrap() = config;
     }
 
     pub(crate) fn stats(&self) -> RequestStats {
@@ -146,9 +171,47 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
         },
     }
 
-    let data = &state.config.data;
-    let body_range = select_body_range(data.len(), request.range, state.config.accept_ranges);
-    let response = response_headers(body_range, state.config.accept_ranges);
+    let config = state.config.read().unwrap().clone();
+    let data = &config.data;
+    let body_range = select_body_range(
+        data.len(),
+        request.range,
+        config.accept_ranges && !config.ignore_ranges,
+    );
+    let mut response = response_headers(body_range, config.accept_ranges);
+    if config.omit_length || (config.extra_range_bytes > 0 && request.method == HttpMethod::Get) {
+        response = response.replace(&format!("Content-Length: {}\r\n", body_range.length), "");
+    }
+    let etag = if request.method == HttpMethod::Get {
+        config.get_etag.as_ref().or(config.etag.as_ref())
+    } else {
+        config.etag.as_ref()
+    };
+    let mut extra_headers = String::new();
+    if let Some(etag) = etag {
+        extra_headers.push_str(&format!("ETag: {etag}\r\n"));
+    }
+    if let Some(encoding) = &config.encoding {
+        extra_headers.push_str(&format!("Content-Encoding: {encoding}\r\n"));
+    }
+    response = response.replace(
+        "Connection: close\r\n",
+        &format!("Connection: close\r\n{extra_headers}"),
+    );
+    if body_range.status == 206
+        && config
+            .range_header_start
+            .is_none_or(|start| start == body_range.start as u64)
+    {
+        if let Some(header) = &config.range_header {
+            let (start, end, total) = body_range.content_range.expect("content range");
+            response = response.replace(
+                &format!("Content-Range: bytes {start}-{end}/{total}"),
+                &format!("Content-Range: {header}"),
+            );
+        }
+    }
+    tokio::time::sleep(config.header_delay).await;
     stream.write_all(response.as_bytes()).await?;
 
     if request.method == HttpMethod::Head || body_range.length == 0 {
@@ -156,25 +219,30 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
     }
 
     let should_interrupt = match request.range {
-        Some(_) => range_get_attempt.expect("range attempt") <= state.config.interrupt_range_gets,
-        None => full_get_attempt.expect("full attempt") <= state.config.interrupt_full_gets,
+        Some(_) => range_get_attempt.expect("range attempt") <= config.interrupt_range_gets,
+        None => full_get_attempt.expect("full attempt") <= config.interrupt_full_gets,
     };
 
     let body = &data[body_range.start..body_range.end];
     let send_limit = if should_interrupt {
-        state.config.interrupt_after_bytes.min(body.len())
+        config.interrupt_after_bytes.min(body.len())
     } else {
         body.len()
     };
 
     let mut sent = 0usize;
     while sent < send_limit {
-        let chunk_end = (sent + state.config.chunk_size).min(send_limit);
+        let chunk_end = (sent + config.chunk_size).min(send_limit);
         stream.write_all(&body[sent..chunk_end]).await?;
         sent = chunk_end;
-        if state.config.chunk_delay > Duration::ZERO && sent < send_limit {
-            tokio::time::sleep(state.config.chunk_delay).await;
+        if config.chunk_delay > Duration::ZERO && sent < send_limit {
+            tokio::time::sleep(config.chunk_delay).await;
         }
+    }
+    if body_range.status == 206 && !should_interrupt {
+        stream
+            .write_all(&vec![0xe7; config.extra_range_bytes])
+            .await?;
     }
     stream.flush().await?;
 

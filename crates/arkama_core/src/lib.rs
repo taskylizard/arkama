@@ -34,6 +34,9 @@
 //! - [`start_download_with_handle`] is the same background API, but lets callers provide a specific
 //!   [`tokio::runtime::Handle`].
 //!
+//! The host owns runtime creation, signals, tracing initialization, and logging destinations.
+//! This crate never registers Ctrl+C and enforces `#![forbid(unsafe_code)]`.
+//!
 //! # Progress events and completion
 //!
 //! Background downloads report lifecycle updates through [`DownloadEvent`]: [`DownloadEvent::Started`],
@@ -47,19 +50,27 @@
 //! completion path returns [`Error::Paused`]. Cancelling returns [`Error::Cancelled`] and removes
 //! partial output/state when possible. [`Error::is_paused`] and [`Error::is_cancelled`] are provided
 //! for callers that want to branch on those outcomes.
+//! Await [`DownloadHandle::join`] before another attempt: it acknowledges that all workers have
+//! stopped. Dropping a background handle detaches it; aborting its task is not coordinated shutdown.
 //!
 //! # Resume behavior
 //!
-//! Resumable state is stored next to the output file as `<output file name>.arkama.state`. A paused
-//! or interrupted segmented download can be resumed by starting another download with the same URL
-//! and output path. State is cleaned up after successful completion. Servers that do not support
-//! HTTP byte ranges fall back to single-stream downloads internally.
+//! Unfinished output uses `<output>.arkama.part`, with a versioned checkpoint at
+//! `<output>.arkama.part.arkama.state`. Only matching strong ETags, source/final URLs, total sizes,
+//! settings, and valid segment coverage permit reuse. A missing/rejected checkpoint restarts from
+//! zero, never from file length. Existing final files are collision errors and are left untouched,
+//! including legacy final-name partials; choose a new path to restart them.
+//! Checkpoints synchronize file data before atomic replacement. The final name is published without
+//! overwriting only after exact response coverage is verified and file data synchronized. Publication
+//! requires hard-link support. A reusable zero-byte `<output>.arkama.lock` prevents competing attempts.
+//! Servers without reliable validators or known sizes use full streams and restart on interruption.
+//! Non-identity HTTP encodings are rejected; automatic decompression is disabled.
 //!
 //! # Segmented downloads
 //!
 //! [`DownloadRequest::connections`] controls the requested number of segmented download workers.
 //! [`DEFAULT_CONNECTIONS`] is `4`. Segmentation is used only when the server reports a known size
-//! and supports HTTP byte ranges; otherwise the request still succeeds through the single-stream
+//! and supports HTTP byte ranges with a strong ETag; otherwise the request uses the single-stream
 //! path when possible.
 //!
 //! # Feature flags
@@ -72,6 +83,8 @@
 //!   resume-state format. Disabling it still compiles the downloader, but persisted resume state is
 //!   unavailable.
 //!
+#![forbid(unsafe_code)]
+
 mod api;
 mod downloader;
 mod error;
