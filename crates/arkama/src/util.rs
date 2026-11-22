@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub fn history_progress_text(downloaded_bytes: i64, total_bytes: Option<i64>) -> String {
     match total_bytes {
@@ -43,17 +43,6 @@ pub fn format_duration(duration: Duration) -> String {
 
 pub fn format_speed(bytes_per_sec: u64) -> String {
     format!("{}/s", format_bytes(bytes_per_sec as i64))
-}
-
-pub fn should_persist_progress(
-    last_update: &Instant,
-    last_bytes: u64,
-    downloaded_bytes: u64,
-) -> bool {
-    if last_update.elapsed() >= std::time::Duration::from_millis(500) {
-        return true;
-    }
-    downloaded_bytes.saturating_sub(last_bytes) >= 512 * 1024
 }
 
 pub fn format_bytes(bytes: i64) -> String {

@@ -100,6 +100,7 @@ version = "0.1.0"
 dependencies = [
  "arkama_core",
  "arkama_data",
+ "arkama_manager",
  "bytefmt",
  "clap",
  "clap_complete",
@@ -111,6 +112,7 @@ dependencies = [
  "hyper-util",
  "indicatif",
  "owo-colors",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -154,6 +156,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "arkama_manager"
+version = "0.1.0"
+dependencies = [
+ "arkama_core",
+ "arkama_data",
+ "bytefmt",
+ "eyre",
+ "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 /// Inclusive durations. Worker timings sum across workers, not wall-clock phases.
@@ -48,6 +48,19 @@ struct Counters {
     suppressed: AtomicU64,
     outcome: AtomicU64,
     durations: [AtomicU64; 8],
+    metadata: OnceLock<DownloadMetadata>,
+}
+
+/// Resolved output and representation metadata, independent of optional event delivery.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug)]
+pub struct DownloadMetadata {
+    pub output: PathBuf,
+    pub total_bytes: Option<u64>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub mime_type: Option<String>,
+    pub final_url: String,
 }
 
 /// Current state independent of optional event and diagnostic readers.
@@ -55,7 +68,8 @@ struct Counters {
 pub struct DownloadObservation(Arc<Counters>);
 
 /// Measurements contain no URLs, headers, cookies, filenames, or error strings.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[derive(Clone, Debug, Default)]
 pub struct ObservationSnapshot {
     /// Age since this attempt was created, including time retained after completion.
@@ -70,7 +84,7 @@ pub struct ObservationSnapshot {
     pub crash_safe_bytes: u64,
     pub retries: u64,
     /// Most recent recovery reason, retained after completion. No source or credential data.
-    pub last_recovery_reason: Option<&'static str>,
+    pub last_recovery_reason: Option<String>,
     pub last_retry_delay_ms: u64,
     pub network_stalls: u64,
     pub active_workers: u64,
@@ -102,6 +116,7 @@ impl DownloadObservation {
             suppressed: AtomicU64::new(0),
             outcome: AtomicU64::new(0),
             durations: std::array::from_fn(|_| AtomicU64::new(0)),
+            metadata: OnceLock::new(),
         }))
     }
 
@@ -115,7 +130,8 @@ impl DownloadObservation {
             disk_written_bytes: load(&self.0.disk_written),
             crash_safe_bytes: load(&self.0.crash_safe),
             retries: load(&self.0.retries),
-            last_recovery_reason: RecoveryReason::label(load(&self.0.recovery_reason)),
+            last_recovery_reason: RecoveryReason::label(load(&self.0.recovery_reason))
+                .map(str::to_owned),
             last_retry_delay_ms: load(&self.0.retry_delay_ms),
             network_stalls: load(&self.0.network_stalls),
             active_workers: load(&self.0.active_workers),
@@ -131,6 +147,16 @@ impl DownloadObservation {
                 .map(|(i, name)| ((*name).into(), load(&self.0.durations[i]) / 1_000_000))
                 .collect(),
         }
+    }
+
+    /// Available once setup resolves and owns the output; retained after this attempt stops.
+    /// Metadata is not included in credential-free numeric diagnostic snapshots.
+    pub fn metadata(&self) -> Option<&DownloadMetadata> {
+        self.0.metadata.get()
+    }
+
+    pub(crate) fn set_metadata(&self, metadata: DownloadMetadata) {
+        let _ = self.0.metadata.set(metadata);
     }
 
     pub(crate) fn written(&self) -> Arc<AtomicU64> {

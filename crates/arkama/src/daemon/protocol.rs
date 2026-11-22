@@ -17,6 +17,7 @@ pub(super) enum DaemonRequest {
     Resume { id: i64 },
     Cancel { id: i64 },
     Retry { id: i64 },
+    Manage { command: arkama_manager::Command },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub(super) enum DaemonResponse {
     Job(DownloadRecord),
     Ok { message: String },
     ShuttingDown,
+    Managed(arkama_manager::Response),
     Error { message: String },
 }
 

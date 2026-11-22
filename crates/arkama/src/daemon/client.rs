@@ -19,6 +19,16 @@ pub(crate) async fn enqueue_download(request: DownloadRequest) -> Result<i64> {
     }
 }
 
+pub(crate) async fn manager_command(
+    command: arkama_manager::Command,
+) -> Result<arkama_manager::Response> {
+    match send_request(DaemonRequest::Manage { command }).await? {
+        DaemonResponse::Managed(response) => Ok(response),
+        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
+        _ => Err(eyre::eyre!("unexpected manager response")),
+    }
+}
+
 pub(crate) async fn list_jobs(limit: usize, query: Option<String>) -> Result<Vec<DownloadRecord>> {
     match send_request(DaemonRequest::List { limit, query }).await? {
         DaemonResponse::Jobs(jobs) => Ok(jobs),
@@ -70,6 +80,12 @@ pub(super) async fn status() -> Result<DaemonStatus> {
 }
 
 pub(super) async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), send_inner(request))
+        .await
+        .context("daemon request timed out; fetch the job state before retrying")?
+}
+
+async fn send_inner(request: DaemonRequest) -> Result<DaemonResponse> {
     let daemon_addr = read_daemon_addr()?;
     let stream = TcpStream::connect(daemon_addr)
         .await

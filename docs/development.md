@@ -36,9 +36,11 @@ so choose the URL and output path intentionally when running them.
 | --- | --- | --- |
 | [`arkama_core`](../crates/arkama_core) | HTTP identity/ranges, transfer workers, partial files, checkpoints, controls, completion. | SQLite, a listener, runtime creation, Ctrl+C registration, or tracing setup. |
 | [`arkama_data`](../crates/arkama_data) | Synchronous SQLite settings/history/queued requests and application paths. | Transfer scheduling, checkpoint validity, or transport. |
+| [`arkama_manager`](../crates/arkama_manager) | Dedicated-thread persistence, scheduling, admission, output reservations, joined controls, snapshots. | Listener, runtime creation, signals, or tracing setup. |
 | [`arkama`](../crates/arkama) | Command parsing, command handlers, terminal/JSON output, signals, and the existing local daemon. | A second download engine or the planned secure server contract. |
 
-Dependencies point from `arkama` to both libraries and from `arkama_data` to core request/result types.
+Dependencies point from `arkama` to the manager/data/core, from the manager to data/core, and from
+data to core request/result types.
 The core does not depend on the application or database. Its `forbid(unsafe_code)` policy stays at
 the crate root; safe dependency APIs may have unsafe internals.
 
@@ -51,9 +53,10 @@ the crate root; safe dependency APIs may have unsafe internals.
   and response validation; `segment.rs` owns byte-range geometry; `error.rs` owns public errors.
 - **CLI:** `cli.rs` parses and dispatches each binary's command tree; `args.rs` supplies shared download
   arguments. `commands/` contains the command handlers, with terminal rendering under `commands/download/`.
-- **Daemon:** `daemon.rs` retains startup, listener handling, and the existing job loop. `daemon/client.rs`
-  sends requests; `daemon/protocol.rs` owns the current wire representation. Moving these modules does
-  not implement the later reusable manager, authentication, or bounded client transport.
+- **Manager:** `model.rs` owns shared commands and snapshots; `actor.rs` owns serialized scheduling,
+  persistence and joined state changes. The crate root owns bounded handles and thread lifecycle.
+- **Daemon:** `daemon.rs` owns startup, signals and bounded connections. `daemon/client.rs` sends
+  requests; `daemon/protocol.rs` owns the current wire representation. Scheduling belongs to the manager.
 - **Data:** `db.rs` owns connection/query access; `db/schema.rs` owns initialization and compatibility
   migrations. `model.rs` defines stored records and `paths.rs` resolves application locations.
 

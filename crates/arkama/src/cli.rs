@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 
 use crate::args::DownloadArgs;
-use crate::commands::{completions, config, download, history, job};
+use crate::commands::{completions, config, download, history, job, manage};
 use crate::daemon;
 
 #[derive(Parser)]
@@ -24,6 +24,8 @@ struct CombinedArgs {
 
 #[derive(Subcommand)]
 enum CombinedCommand {
+    #[command(about = "Execute a shared manager command as JSON.")]
+    Manage(manage::ManageArgs),
     #[command(about = "Add a download job to the daemon.")]
     Add(DownloadArgs),
 
@@ -78,6 +80,8 @@ struct CliArgs {
 
 #[derive(Subcommand)]
 enum CliCommand {
+    #[command(about = "Execute a shared manager command as JSON.")]
+    Manage(manage::ManageArgs),
     #[command(about = "Add a download job to the daemon.")]
     Add(DownloadArgs),
 
@@ -129,6 +133,7 @@ pub async fn run_combined() -> Result<()> {
     }
 
     match args.command {
+        CombinedCommand::Manage(args) => manage::run(args).await,
         CombinedCommand::Add(mut download_args) => {
             download_args.daemon = true;
             download::run(download_args).await
@@ -157,6 +162,7 @@ pub async fn run_cli() -> Result<()> {
     }
 
     match args.command {
+        CliCommand::Manage(args) => manage::run(args).await,
         CliCommand::Add(mut download_args) => {
             download_args.daemon = true;
             download::run(download_args).await

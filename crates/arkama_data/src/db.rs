@@ -22,12 +22,14 @@ impl Db {
         Self::open_path(&path)
     }
 
-    fn open_path(path: &Path) -> Result<Self> {
+    /// Opens an explicit store. Synchronous; call away from transfer and UI threads.
+    pub fn open_path(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create data dir {parent:?}"))?;
         }
         let conn = Connection::open(path).context("failed to open sqlite db")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let db = Self { conn };
         db.init()?;
         Ok(db)
@@ -100,8 +102,10 @@ impl Db {
                 priority,
                 created_at,
                 updated_at,
-                daemon_request
-             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, 'default', 0, ?5, ?5, ?6)",
+                daemon_request,
+                state_since_ms,
+                output_key
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, 'default', 0, ?5, ?5, ?6, ?7, ?8)",
             params![
                 url,
                 output_path.display().to_string(),
@@ -109,17 +113,20 @@ impl Db {
                 0i64,
                 now,
                 request,
+                now_ms(),
+                output_key(output_path),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     pub fn update_daemon_request(&self, id: i64, request: &DownloadRequest) -> Result<()> {
+        let output = queued_output_path(request);
         let request =
             serde_json::to_string(request).context("failed to serialize daemon request")?;
         self.conn.execute(
-            "UPDATE downloads SET daemon_request = ?1, updated_at = ?2 WHERE id = ?3",
-            params![request, now_ts(), id],
+            "UPDATE downloads SET daemon_request = ?1, updated_at = ?2, output_path = ?4, output_key = ?5 WHERE id = ?3",
+            params![request, now_ts(), id, output.to_string_lossy(), output_key(output)],
         )?;
         Ok(())
     }
@@ -135,7 +142,8 @@ impl Db {
         self.conn.execute(
             "UPDATE downloads
              SET output_path = ?1, status = 'running', error_message = NULL,
-                 total_bytes = ?2, downloaded_bytes = ?3, finished_at = NULL, updated_at = ?4
+                 total_bytes = ?2, downloaded_bytes = ?3, finished_at = NULL, updated_at = ?4,
+                 output_key = ?6
              WHERE id = ?5",
             params![
                 output_path.display().to_string(),
@@ -143,6 +151,7 @@ impl Db {
                 downloaded_bytes as i64,
                 now_ts(),
                 id,
+                output_key(output_path),
             ],
         )?;
         Ok(())
@@ -217,7 +226,7 @@ impl Db {
     pub fn update_download_cancelled(&self, id: i64) -> Result<()> {
         let finished_at = now_ts();
         self.conn.execute(
-            "UPDATE downloads SET status = 'cancelled', finished_at = ?1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE downloads SET status = 'cancelled', downloaded_bytes = 0, finished_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![finished_at, id],
         )?;
         Ok(())
@@ -306,9 +315,10 @@ impl Db {
     pub fn recover_daemon_downloads(&self) -> Result<()> {
         self.conn.execute(
             "UPDATE downloads
-             SET status = 'queued', finished_at = NULL, updated_at = ?1
-             WHERE daemon_request IS NOT NULL AND (status = 'starting' OR status = 'running')",
-            params![now_ts()],
+             SET status = CASE WHEN status IN ('pausing', 'cancelling') THEN 'paused' ELSE 'queued' END,
+                 finished_at = NULL, updated_at = ?1, state_since_ms = ?2
+             WHERE daemon_request IS NOT NULL AND status IN ('starting', 'running', 'pausing', 'cancelling')",
+            params![now_ts(), now_ms()],
         )?;
         Ok(())
     }
@@ -330,8 +340,11 @@ impl Db {
             let request: String = row.get(1)?;
 
             let claimed = self.conn.execute(
-                "UPDATE downloads SET status = 'starting', finished_at = NULL, updated_at = ?1 WHERE id = ?2 AND status = 'queued'",
-                params![now_ts(), id],
+                "UPDATE downloads SET status = 'starting', finished_at = NULL, updated_at = ?1,
+                    queue_wait_ms = queue_wait_ms + MAX(0, ?3 - state_since_ms), state_since_ms = ?3,
+                    attempt_started = 1
+                 WHERE id = ?2 AND status = 'queued'",
+                params![now_ts(), id, now_ms()],
             )?;
             if claimed == 0 {
                 continue;
@@ -394,9 +407,116 @@ impl Db {
 
         Ok(records)
     }
+
+    /// Paged history and search. Callers validate page sizes and offsets.
+    pub fn load_downloads_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        query: &str,
+    ) -> Result<Vec<DownloadRecord>> {
+        let sql = DOWNLOAD_RECORD_SELECT.to_string()
+            + " WHERE url LIKE ?1 OR output_path LIKE ?1 OR status LIKE ?1 OR error_message LIKE ?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3";
+        let mut statement = self.conn.prepare(&sql)?;
+        let records = statement.query_map(
+            params![format!("%{query}%"), limit as i64, offset as i64],
+            map_download_record,
+        )?;
+        records
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Accounts for queued/paused time and changes status atomically for manager-owned jobs.
+    pub fn transition_download(&self, id: i64, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads SET
+                queue_wait_ms = queue_wait_ms + CASE WHEN status = 'queued' THEN MAX(0, ?1 - state_since_ms) ELSE 0 END,
+                paused_ms = paused_ms + CASE WHEN status = 'paused' THEN MAX(0, ?1 - state_since_ms) ELSE 0 END,
+                state_since_ms = ?1, status = ?2, updated_at = ?3
+             WHERE id = ?4 AND status != ?2",
+            params![now_ms(), status, now_ts(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_daemon_request(&self, id: i64) -> Result<Option<DownloadRequest>> {
+        let serialized: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT daemon_request FROM downloads WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        serialized
+            .map(|request| serde_json::from_str(&request).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn output_owner(&self, output: &Path, except_id: i64) -> Result<Option<i64>> {
+        self.conn.query_row(
+            "SELECT id FROM downloads WHERE daemon_request IS NOT NULL AND output_key = ?1 AND id != ?2 AND status != 'cancelled' LIMIT 1",
+            params![output_key(output), except_id], |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
+    /// Refreshes filesystem identities during manager startup, including legacy or moved stores.
+    pub fn refresh_output_keys(&self) -> Result<()> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id, output_path FROM downloads WHERE daemon_request IS NOT NULL")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let output: String = row.get(1)?;
+            self.conn.execute(
+                "UPDATE downloads SET output_key = ?1 WHERE id = ?2",
+                params![output_key(Path::new(&output)), id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether a managed attempt could have created partial artifacts, independent of diagnostics.
+    pub fn attempt_started(&self, id: i64) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT attempt_started FROM downloads WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn save_observation(
+        &self,
+        id: i64,
+        observation: &arkama_core::ObservationSnapshot,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads SET observation_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(observation)?, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_observation(&self, id: i64) -> Result<Option<arkama_core::ObservationSnapshot>> {
+        let serialized: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT observation_json FROM downloads WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(serialized.and_then(|snapshot| serde_json::from_str(&snapshot).ok()))
+    }
 }
 
-const DOWNLOAD_RECORD_SELECT: &str = "SELECT id, url, output_path, status, error_message, queue_name, priority, total_bytes, downloaded_bytes, started_at, finished_at, created_at, updated_at FROM downloads";
+const DOWNLOAD_RECORD_SELECT: &str = "SELECT id, url, output_path, status, error_message, queue_name, priority, total_bytes, downloaded_bytes, started_at, finished_at, created_at, updated_at, queue_wait_ms, paused_ms, state_since_ms FROM downloads";
 
 fn map_download_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
     Ok(DownloadRecord {
@@ -413,6 +533,9 @@ fn map_download_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadReco
         finished_at: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        queue_wait_ms: row.get(13)?,
+        paused_ms: row.get(14)?,
+        state_since_ms: row.get(15)?,
     })
 }
 
@@ -423,12 +546,35 @@ fn queued_output_path(request: &DownloadRequest) -> &Path {
     output
 }
 
+fn output_key(output: &Path) -> String {
+    let mut lock_name = output.file_name().unwrap_or_default().to_os_string();
+    lock_name.push(".arkama.lock");
+    let lock = output.with_file_name(lock_name);
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(&lock) {
+        use std::os::unix::fs::MetadataExt;
+        return format!("inode:{}:{}", metadata.dev(), metadata.ino());
+    }
+    lock.canonicalize()
+        .unwrap_or(lock)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn now_ts() -> i64 {
     let now = SystemTime::now();
     let Ok(duration) = now.duration_since(UNIX_EPOCH) else {
         return 0;
     };
     duration.as_secs() as i64
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]

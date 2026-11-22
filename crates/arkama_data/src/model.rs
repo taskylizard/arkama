@@ -15,4 +15,10 @@ pub struct DownloadRecord {
     pub finished_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub queue_wait_ms: i64,
+    #[serde(default)]
+    pub paused_ms: i64,
+    #[serde(default)]
+    pub state_since_ms: i64,
 }

@@ -40,7 +40,8 @@ or `arkama-cli download --help` for download options.
 - Retry/backoff and an aggregate speed limit across the workers of one download.
 - Terminal progress, silent mode, and JSON events. Progress is sampled at most once per 500 ms, not every chunk.
 - SQLite settings and history, search, sequential links-file input, and shell completions.
-- A local daemon with persisted jobs and add/list/show/pause/resume/cancel/retry commands.
+- A persistent manager shared by the local daemon and explicit embedded/no-server use, with joined
+  controls, output reservations, live settings, and bounded paginated history.
 
 The daemon is an existing local tool, not the secure client-facing server planned for the foundation.
 The experimental connection-entropy option is opt-in for bonded LACP/ECMP setups, not a general
@@ -86,13 +87,12 @@ documentation, and feature/MSRV checks.
 
 ## Next milestones
 
-The reliable resume/completion, safe-core API, and bounded-observation milestones are implemented.
+The reliability/safe-core API, bounded observations, configurable recovery, and shared-manager
+milestones are implemented. See the [manager contract](crates/arkama_manager/README.md).
 Optional diagnostics use a dedicated OS thread; slow observers cannot back up the transfer path.
 
 The remaining foundation work is:
 
-3. Configurable timeouts, retries, and flaky-link recovery.
-4. One persistent manager shared by server and explicit no-server operation.
 5. A secure single-owner server and bounded, reconnectable client API.
 6. Named queues, shared limits, folder rules, and scheduled download windows.
 7. Credential-safe browser request context and duplicate-safe client handoff.

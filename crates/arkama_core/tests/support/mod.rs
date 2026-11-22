@@ -231,18 +231,18 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
         "Connection: close\r\n",
         &format!("Connection: close\r\n{extra_headers}"),
     );
-    if body_range.status == 206
-        && config
-            .range_header_start
-            .is_none_or(|start| start == body_range.start as u64)
-    {
-        if let Some(header) = &config.range_header {
-            let (start, end, total) = body_range.content_range.expect("content range");
-            response = response.replace(
-                &format!("Content-Range: bytes {start}-{end}/{total}"),
-                &format!("Content-Range: {header}"),
-            );
-        }
+    if let (true, Some(header)) = (
+        body_range.status == 206
+            && config
+                .range_header_start
+                .is_none_or(|start| start == body_range.start as u64),
+        config.range_header.as_ref(),
+    ) {
+        let (start, end, total) = body_range.content_range.expect("content range");
+        response = response.replace(
+            &format!("Content-Range: bytes {start}-{end}/{total}"),
+            &format!("Content-Range: {header}"),
+        );
     }
     tokio::time::sleep(config.header_delay).await;
     stream.write_all(response.as_bytes()).await?;

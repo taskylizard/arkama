@@ -171,7 +171,7 @@ async fn recovery_honors_retry_after_and_refuses_an_excessive_wait() {
             assert_eq!(observation.snapshot().last_retry_delay_ms, 1000);
             assert_eq!(
                 observation.snapshot().last_recovery_reason,
-                Some("server throttling")
+                Some("server throttling".into())
             );
             assert_downloaded(&path, &data).await;
         }
@@ -699,6 +699,12 @@ async fn optional_event_reader_does_not_determine_completion() {
         let summary = handle.join.await.unwrap().unwrap();
         assert_eq!(summary.downloaded_bytes, data.len() as u64);
         assert_downloaded(&path, &data).await;
+        let metadata = handle
+            .observation
+            .metadata()
+            .expect("metadata survives absent events");
+        assert_eq!(metadata.output, path);
+        assert_eq!(metadata.total_bytes, Some(data.len() as u64));
         drop(events);
     }
 }

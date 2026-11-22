@@ -11,7 +11,7 @@ use crate::DownloadObservation;
 use crate::http::{self, ClientFactory};
 use crate::observation::Phase;
 use crate::recovery::RetryBudget;
-use crate::{DownloadEvent, DownloadRequest, DownloadSummary};
+use crate::{DownloadEvent, DownloadMetadata, DownloadRequest, DownloadSummary};
 use eyre::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -78,6 +78,14 @@ pub(super) async fn download_inner(
     let checkpoint = state_path(&partial)?;
     let resume = load_state(&checkpoint).ok();
     let total_downloaded = observation.written();
+    let metadata = DownloadMetadata {
+        output: output.clone(),
+        total_bytes: meta.size,
+        etag: meta.etag.clone(),
+        last_modified: meta.last_modified.clone(),
+        mime_type: meta.mime_type.clone(),
+        final_url: meta.final_url.clone(),
+    };
     let mut plan = DownloadPlan::new(DownloadPlanConfig {
         url,
         output: partial.clone(),
@@ -92,6 +100,7 @@ pub(super) async fn download_inner(
         observation: observation.clone(),
         stop_rx: stop_rx.clone(),
     })?;
+    observation.set_metadata(metadata);
     let resumed = plan.already_downloaded();
     total_downloaded.store(resumed, Ordering::Relaxed);
     observation.checkpoint(resumed);
@@ -113,6 +122,7 @@ pub(super) async fn download_inner(
     if signal == StopSignal::Cancel {
         remove_if_exists(&checkpoint)?;
         remove_if_exists(&partial)?;
+        total_downloaded.store(0, Ordering::Relaxed);
         observation.checkpoint(0);
     }
     let result = if signal == StopSignal::Cancel || (signal == StopSignal::Pause && result.is_ok())

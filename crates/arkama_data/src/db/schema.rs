@@ -80,6 +80,39 @@ impl Db {
             self.conn
                 .execute("ALTER TABLE downloads ADD COLUMN final_url TEXT", [])?;
         }
+        for column in ["queue_wait_ms", "paused_ms", "state_since_ms"] {
+            if !self.downloads_column_exists(column)? {
+                self.conn.execute(
+                    &format!(
+                        "ALTER TABLE downloads ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    ),
+                    [],
+                )?;
+            }
+        }
+        self.conn.execute("UPDATE downloads SET state_since_ms = COALESCE(updated_at, started_at) * 1000 WHERE state_since_ms = 0", [])?;
+        if !self.downloads_column_exists("observation_json")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN observation_json TEXT", [])?;
+        }
+        if !self.downloads_column_exists("attempt_started")? {
+            self.conn.execute(
+                "ALTER TABLE downloads ADD COLUMN attempt_started INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE downloads SET attempt_started = 1 WHERE status != 'queued' OR final_url IS NOT NULL OR observation_json IS NOT NULL",
+                [],
+            )?;
+        }
+        if !self.downloads_column_exists("output_key")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN output_key TEXT", [])?;
+        }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS downloads_output_key ON downloads(output_key)",
+            [],
+        )?;
         Ok(())
     }
 

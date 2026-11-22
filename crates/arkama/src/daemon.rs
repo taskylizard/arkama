@@ -1,402 +1,60 @@
-//! Local daemon startup, listener, and the existing job loop.
-//!
-//! Wire types and client requests live in child modules. This remains the local daemon,
-//! not the shared manager or authenticated server planned for later milestones.
+//! Host startup and the local transport. Scheduling and SQLite live in arkama_manager.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use arkama_core::{
-    DownloadControl, DownloadEvent, DownloadRequest, DownloadSession, DownloadSummary,
-};
-use arkama_data::{Db, daemon_addr_path, daemon_log_path};
+use arkama_data::{daemon_addr_path, daemon_log_path, db_path};
+use arkama_manager::{Command, Manager, Response};
 use clap::Subcommand;
 use eyre::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
-
-use crate::util::should_persist_progress;
 
 mod client;
 mod protocol;
 
 pub(crate) use client::{
-    cancel_job, enqueue_download, list_jobs, pause_job, resume_job, retry_job, show_job,
+    cancel_job, enqueue_download, list_jobs, manager_command, pause_job, resume_job, retry_job,
+    show_job,
 };
 use client::{send_request, status};
 use protocol::{DaemonRequest, DaemonResponse, DaemonStatus};
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
-    #[command(about = "Run the daemon in the foreground.")]
-    Run,
-
+    #[command(about = "Run the download host in the foreground.")]
+    Run {
+        #[arg(long, help = "Run the shared manager without a control listener.")]
+        no_server: bool,
+    },
     #[command(about = "Start the daemon in the background.")]
     Start,
-
     #[command(about = "Show daemon status.")]
     Status,
-
-    #[command(about = "Ask the daemon to stop.")]
+    #[command(about = "Ask the daemon to stop and join its downloads.")]
     Stop,
-}
-
-struct ActiveDownload {
-    id: i64,
-    request: DownloadRequest,
-    receiver: tokio_mpsc::Receiver<DownloadEvent>,
-    done_rx: mpsc::Receiver<Result<DownloadSummary>>,
-    control: DownloadControl,
-    downloaded_bytes: u64,
-    last_db_update: Instant,
-    last_db_bytes: u64,
-}
-
-struct CommandMessage {
-    request: DaemonRequest,
-    response_tx: oneshot::Sender<DaemonResponse>,
 }
 
 struct AddrFileGuard {
     path: PathBuf,
 }
-
 impl Drop for AddrFileGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-struct DaemonState {
-    runtime: Handle,
-    session: DownloadSession,
-    db: Db,
-    max_concurrent: usize,
-    active: Vec<ActiveDownload>,
-    stopping: bool,
-}
-
-impl DaemonState {
-    fn new(runtime: Handle) -> Result<Self> {
-        let db = Db::open()?;
-        db.recover_daemon_downloads()?;
-        let max_concurrent = db
-            .get_setting("max_concurrent")?
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3usize)
-            .max(1);
-
-        Ok(Self {
-            runtime,
-            session: DownloadSession::default(),
-            db,
-            max_concurrent,
-            active: Vec::new(),
-            stopping: false,
-        })
-    }
-
-    fn status(&self) -> Result<DaemonStatus> {
-        Ok(DaemonStatus {
-            pid: std::process::id(),
-            active: self.active.len(),
-            queued: self.db.count_queued_daemon_downloads()?,
-        })
-    }
-
-    fn handle_request(&mut self, request: DaemonRequest) -> Result<DaemonResponse> {
-        match request {
-            DaemonRequest::Ping => Ok(DaemonResponse::Pong(self.status()?)),
-            DaemonRequest::Shutdown => {
-                self.begin_shutdown()?;
-                Ok(DaemonResponse::ShuttingDown)
-            }
-            DaemonRequest::Enqueue(request) => {
-                let id = self.enqueue(request.into())?;
-                Ok(DaemonResponse::Enqueued { id })
-            }
-            DaemonRequest::List { limit, query } => {
-                let jobs = match query {
-                    Some(query) => self.db.load_downloads(&query)?,
-                    None => self.db.load_downloads_limit(limit)?,
-                };
-                Ok(DaemonResponse::Jobs(jobs))
-            }
-            DaemonRequest::Show { id } => {
-                let Some(job) = self.db.load_download(id)? else {
-                    return Err(eyre::eyre!("job {id} not found"));
-                };
-                Ok(DaemonResponse::Job(job))
-            }
-            DaemonRequest::Pause { id } => self.pause_job(id),
-            DaemonRequest::Resume { id } => self.resume_job(id),
-            DaemonRequest::Cancel { id } => self.cancel_job(id),
-            DaemonRequest::Retry { id } => self.retry_job(id),
-        }
-    }
-
-    fn enqueue(&mut self, request: DownloadRequest) -> Result<i64> {
-        if self.stopping {
-            return Ok(-1);
-        }
-
-        let id = self.db.insert_daemon_download(&request)?;
-        self.schedule()?;
-        Ok(id)
-    }
-
-    fn schedule(&mut self) -> Result<()> {
-        if self.stopping {
-            return Ok(());
-        }
-
-        while self.active.len() < self.max_concurrent {
-            let Some((id, request)) = self.db.claim_next_daemon_download()? else {
-                break;
-            };
-            if let Err(err) = self.start_one(id, request) {
-                self.db.update_download_failed(id, &err.to_string())?;
-                error!("failed to start queued download {id}: {err:#}");
-            }
-        }
-        Ok(())
-    }
-
-    fn start_one(&mut self, id: i64, request: DownloadRequest) -> Result<()> {
-        let handle = self
-            .session
-            .start_with_handle(self.runtime.clone(), request.clone())?;
-
-        let (done_tx, done_rx) = mpsc::channel();
-        let join = handle.join;
-        self.runtime.spawn(async move {
-            let result = match join.await {
-                Ok(Ok(summary)) => Ok(summary),
-                Ok(Err(err)) => Err(err.into()),
-                Err(err) => Err(eyre::eyre!(err)),
-            };
-            let _ = done_tx.send(result);
-        });
-
-        self.active.push(ActiveDownload {
-            id,
-            request,
-            receiver: handle.events,
-            done_rx,
-            control: handle.control,
-            downloaded_bytes: 0,
-            last_db_update: Instant::now(),
-            last_db_bytes: 0,
-        });
-
-        Ok(())
-    }
-
-    fn begin_shutdown(&mut self) -> Result<()> {
-        if self.stopping {
-            return Ok(());
-        }
-
-        self.stopping = true;
-
-        for active in &mut self.active {
-            self.db
-                .requeue_download(active.id, active.downloaded_bytes)?;
-            active.control.pause();
-        }
-
-        Ok(())
-    }
-
-    fn pause_job(&mut self, id: i64) -> Result<DaemonResponse> {
-        if let Some(active) = self.active.iter_mut().find(|active| active.id == id) {
-            active.control.pause();
-            self.db
-                .update_download_paused(id, active.downloaded_bytes)?;
-            return Ok(DaemonResponse::Ok {
-                message: format!("paused job {id}"),
-            });
-        }
-
-        if self.db.mark_queued_paused(id)? {
-            return Ok(DaemonResponse::Ok {
-                message: format!("paused job {id}"),
-            });
-        }
-
-        let Some(status) = self.db.download_status(id)? else {
-            return Err(eyre::eyre!("job {id} not found"));
-        };
-        Err(eyre::eyre!("job {id} cannot be paused from {status}"))
-    }
-
-    fn resume_job(&mut self, id: i64) -> Result<DaemonResponse> {
-        if !self.db.resume_download(id)? {
-            let Some(status) = self.db.download_status(id)? else {
-                return Err(eyre::eyre!("job {id} not found"));
-            };
-            return Err(eyre::eyre!("job {id} cannot be resumed from {status}"));
-        }
-        self.schedule()?;
-        Ok(DaemonResponse::Ok {
-            message: format!("resumed job {id}"),
-        })
-    }
-
-    fn cancel_job(&mut self, id: i64) -> Result<DaemonResponse> {
-        if let Some(active) = self.active.iter_mut().find(|active| active.id == id) {
-            active.control.cancel();
-            self.db.update_download_cancelled(id)?;
-            return Ok(DaemonResponse::Ok {
-                message: format!("cancelled job {id}"),
-            });
-        }
-
-        let Some(status) = self.db.download_status(id)? else {
-            return Err(eyre::eyre!("job {id} not found"));
-        };
-        match status.as_str() {
-            "queued" | "paused" | "starting" | "running" => {
-                self.db.update_download_cancelled(id)?;
-                Ok(DaemonResponse::Ok {
-                    message: format!("cancelled job {id}"),
-                })
-            }
-            _ => Err(eyre::eyre!("job {id} cannot be cancelled from {status}")),
-        }
-    }
-
-    fn retry_job(&mut self, id: i64) -> Result<DaemonResponse> {
-        if !self.db.retry_download(id)? {
-            let Some(status) = self.db.download_status(id)? else {
-                return Err(eyre::eyre!("job {id} not found"));
-            };
-            return Err(eyre::eyre!("job {id} cannot be retried from {status}"));
-        }
-        self.schedule()?;
-        Ok(DaemonResponse::Ok {
-            message: format!("retried job {id}"),
-        })
-    }
-
-    fn poll_active(&mut self) -> Result<()> {
-        let mut finished: Vec<(i64, DownloadSummary)> = Vec::new();
-        let mut failed: Vec<(i64, String, u64)> = Vec::new();
-
-        for active in &mut self.active {
-            let mut processed = 0usize;
-            while processed < 200 {
-                match active.receiver.try_recv() {
-                    Ok(event) => match event {
-                        DownloadEvent::Metadata {
-                            etag,
-                            last_modified,
-                            mime_type,
-                            final_url,
-                        } => {
-                            self.db.update_download_metadata(
-                                active.id,
-                                etag.as_deref(),
-                                last_modified.as_deref(),
-                                mime_type.as_deref(),
-                                &final_url,
-                            )?;
-                        }
-                        DownloadEvent::Started {
-                            output,
-                            total_bytes,
-                            resumed_bytes,
-                        } => {
-                            active.downloaded_bytes = resumed_bytes;
-                            active.request.output = Some(output.clone());
-                            self.db.update_daemon_request(active.id, &active.request)?;
-                            self.db.update_download_started(
-                                active.id,
-                                &output,
-                                total_bytes,
-                                resumed_bytes,
-                            )?;
-                        }
-                        DownloadEvent::Progress {
-                            downloaded_bytes,
-                            total_bytes,
-                        } => {
-                            active.downloaded_bytes = downloaded_bytes;
-                            if should_persist_progress(
-                                &active.last_db_update,
-                                active.last_db_bytes,
-                                downloaded_bytes,
-                            ) {
-                                active.last_db_update = Instant::now();
-                                active.last_db_bytes = downloaded_bytes;
-                                self.db.update_download_progress(
-                                    active.id,
-                                    total_bytes,
-                                    downloaded_bytes,
-                                )?;
-                            }
-                        }
-                        DownloadEvent::Finished { summary } => {
-                            finished.push((active.id, summary));
-                            break;
-                        }
-                        DownloadEvent::Failed { message } => {
-                            failed.push((active.id, message, active.downloaded_bytes));
-                            break;
-                        }
-                    },
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                }
-                processed += 1;
-            }
-
-            match active.done_rx.try_recv() {
-                Ok(Ok(summary)) => finished.push((active.id, summary)),
-                Ok(Err(err)) => failed.push((active.id, err.to_string(), active.downloaded_bytes)),
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {}
-            }
-        }
-
-        for (id, summary) in finished {
-            self.db.update_download_finished(id, &summary)?;
-            self.active.retain(|active| active.id != id);
-        }
-
-        for (id, message, downloaded_bytes) in failed {
-            if message == "interrupted" {
-                if self.db.download_status(id)?.as_deref() != Some("paused") {
-                    self.db.requeue_download(id, downloaded_bytes)?;
-                }
-            } else if message == "cancelled" {
-                self.db.update_download_cancelled(id)?;
-            } else if !matches!(
-                self.db.download_status(id)?.as_deref(),
-                Some("paused" | "cancelled")
-            ) {
-                self.db.update_download_failed(id, &message)?;
-            } else {
-                let _ = message;
-            }
-            self.active.retain(|active| active.id != id);
-        }
-
-        self.schedule()?;
-        Ok(())
-    }
-}
-
 pub async fn run(command: DaemonCommand) -> Result<()> {
     match command {
-        DaemonCommand::Run => run_foreground().await,
+        DaemonCommand::Run { no_server } => run_foreground(no_server).await,
         DaemonCommand::Start => start_background().await,
         DaemonCommand::Status => status_command().await,
         DaemonCommand::Stop => stop_command().await,
@@ -406,15 +64,12 @@ pub async fn run(command: DaemonCommand) -> Result<()> {
 fn init_tracing() -> Result<()> {
     let path = daemon_log_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create daemon log dir {parent:?}"))?;
+        std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open daemon log {path:?}"))?;
-
+        .open(&path)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .with_target(false)
@@ -423,58 +78,136 @@ fn init_tracing() -> Result<()> {
     Ok(())
 }
 
-async fn run_foreground() -> Result<()> {
+async fn run_foreground(no_server: bool) -> Result<()> {
     init_tracing()?;
+    let manager = Manager::open(db_path()?, Handle::current()).await?;
+    if no_server {
+        tokio::select! {
+            _ = manager.closed() => {}
+            signal = tokio::signal::ctrl_c() => { signal?; }
+        }
+        return manager.shutdown().await.map_err(Into::into);
+    }
+    let result = serve(manager.clone()).await;
+    manager.shutdown().await?;
+    result
+}
 
+async fn serve(manager: Manager) -> Result<()> {
+    let bind_addr = daemon_bind_addr()?;
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .context("failed to bind daemon listener")?;
+    let listen_addr = listener.local_addr()?;
     let addr_path = daemon_addr_path()?;
-    let listener = prepare_listener().await?;
-    let listen_addr = listener
-        .local_addr()
-        .context("failed to resolve daemon listener address")?;
     write_daemon_addr(&addr_path, listen_addr)?;
     let _guard = AddrFileGuard { path: addr_path };
-    let runtime = Handle::current();
-    let mut daemon = DaemonState::new(runtime)?;
-    daemon.schedule()?;
-    let (command_tx, mut command_rx) = tokio_mpsc::unbounded_channel::<CommandMessage>();
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-
+    let slots = Arc::new(Semaphore::new(32));
+    let mut connections = JoinSet::new();
     info!("daemon listening on {listen_addr}");
-
     loop {
-        if daemon.stopping && daemon.active.is_empty() {
-            break;
-        }
-
         tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, _) = accept_result.context("failed to accept daemon client")?;
-                let command_tx = command_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, command_tx).await {
-                        error!("daemon client error: {err:#}");
-                    }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let Ok(slot) = slots.clone().try_acquire_owned() else { continue; };
+                let manager = manager.clone();
+                connections.spawn(async move {
+                    let _slot = slot;
+                    let _ = tokio::time::timeout(Duration::from_secs(30), handle_connection(stream, manager)).await;
                 });
             }
-            Some(message) = command_rx.recv() => {
-                let response = match daemon.handle_request(message.request) {
-                    Ok(response) => response,
-                    Err(err) => DaemonResponse::Error { message: err.to_string() },
-                };
-                let _ = message.response_tx.send(response);
-            }
-            _ = ticker.tick() => {
-                daemon.poll_active()?;
-            }
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for ctrl-c")?;
-                daemon.begin_shutdown()?;
-            }
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            _ = manager.closed() => break,
+            signal = tokio::signal::ctrl_c() => { signal?; manager.shutdown().await?; break; }
         }
     }
-
+    drop(listener);
+    // Allow the connection that requested shutdown to deliver its acknowledged reply.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
     info!("daemon stopped");
     Ok(())
+}
+
+async fn handle_connection(stream: TcpStream, manager: Manager) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half.take(65_537));
+    let mut line = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\n', &mut line)).await??;
+    if line.len() > 65_536 || line.last() != Some(&b'\n') {
+        return Err(eyre::eyre!("invalid request size or framing"));
+    }
+    let request: DaemonRequest =
+        serde_json::from_slice(&line).map_err(|_| eyre::eyre!("invalid daemon request"))?;
+    let response = adapt_request(&manager, request).await;
+    let response = serde_json::to_vec(&response)?;
+    if response.len() > 2 * 1024 * 1024 {
+        return Err(eyre::eyre!("response exceeds limit"));
+    }
+    write_half.write_all(&response).await?;
+    write_half.write_all(b"\n").await?;
+    Ok(())
+}
+
+async fn adapt_request(manager: &Manager, request: DaemonRequest) -> DaemonResponse {
+    if matches!(request, DaemonRequest::Shutdown) {
+        return match manager.shutdown().await {
+            Ok(()) => DaemonResponse::ShuttingDown,
+            Err(error) => DaemonResponse::Error {
+                message: error.to_string(),
+            },
+        };
+    }
+    let action = match request {
+        DaemonRequest::Pause { .. } => "paused",
+        DaemonRequest::Resume { .. } => "resumed",
+        DaemonRequest::Cancel { .. } => "cancelled",
+        DaemonRequest::Retry { .. } => "retried",
+        _ => "",
+    };
+    let managed = matches!(request, DaemonRequest::Manage { .. });
+    let command = match request {
+        DaemonRequest::Ping => Command::Status,
+        DaemonRequest::Enqueue(request) => Command::Enqueue {
+            request: request.into(),
+        },
+        DaemonRequest::List { limit, query } => Command::List {
+            limit,
+            offset: 0,
+            query: query.unwrap_or_default(),
+        },
+        DaemonRequest::Show { id } => Command::Show { id },
+        DaemonRequest::Pause { id } => Command::Pause { id },
+        DaemonRequest::Resume { id } => Command::Resume { id },
+        DaemonRequest::Cancel { id } => Command::Cancel { id },
+        DaemonRequest::Retry { id } => Command::Retry { id },
+        DaemonRequest::Manage { command } => command,
+        DaemonRequest::Shutdown => unreachable!("shutdown handled before command translation"),
+    };
+    match manager.execute(command).await {
+        Ok(response) if managed => DaemonResponse::Managed(response),
+        Ok(Response::Status(status)) => DaemonResponse::Pong(DaemonStatus {
+            pid: status.pid,
+            active: status.active,
+            queued: status.queued,
+        }),
+        Ok(Response::Accepted { id }) => DaemonResponse::Enqueued { id },
+        Ok(Response::Jobs { jobs, .. }) => {
+            DaemonResponse::Jobs(jobs.into_iter().map(|job| job.record).collect())
+        }
+        Ok(Response::Job(job)) if !action.is_empty() => DaemonResponse::Ok {
+            message: format!("{action} job {}", job.record.id),
+        },
+        Ok(Response::Job(job)) => DaemonResponse::Job(job.record),
+        Ok(_) => DaemonResponse::Error {
+            message: "unsupported legacy response".into(),
+        },
+        Err(error) => DaemonResponse::Error {
+            message: error.to_string(),
+        },
+    }
 }
 
 async fn start_background() -> Result<()> {
@@ -485,7 +218,6 @@ async fn start_background() -> Result<()> {
         );
         return Ok(());
     }
-
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     let mut child = std::process::Command::new(exe)
         .arg("daemon")
@@ -495,10 +227,8 @@ async fn start_background() -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn daemon")?;
-
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-
         if let Ok(status) = status().await {
             println!(
                 "daemon started (pid {}): {} active, {} queued",
@@ -506,12 +236,10 @@ async fn start_background() -> Result<()> {
             );
             return Ok(());
         }
-
-        if let Some(exit_status) = child.try_wait().context("failed to poll daemon process")? {
-            return Err(eyre::eyre!("daemon exited early with status {exit_status}"));
+        if let Some(exit) = child.try_wait()? {
+            return Err(eyre::eyre!("daemon exited early with status {exit}"));
         }
     }
-
     Err(eyre::eyre!("daemon did not become ready"))
 }
 
@@ -525,10 +253,9 @@ async fn status_command() -> Result<()> {
 }
 
 async fn stop_command() -> Result<()> {
-    let response = send_request(DaemonRequest::Shutdown).await?;
-    match response {
+    match send_request(DaemonRequest::Shutdown).await? {
         DaemonResponse::ShuttingDown => {
-            println!("daemon stopping");
+            println!("daemon stopped");
             Ok(())
         }
         DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
@@ -536,90 +263,38 @@ async fn stop_command() -> Result<()> {
     }
 }
 
-async fn prepare_listener() -> Result<TcpListener> {
-    if status().await.is_ok() {
-        return Err(eyre::eyre!("daemon already running"));
-    }
-
-    let bind_addr = daemon_bind_addr()?;
-    TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("failed to bind daemon listener to {bind_addr}"))
-}
-
-async fn handle_connection(
-    stream: TcpStream,
-    command_tx: tokio_mpsc::UnboundedSender<CommandMessage>,
-) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read daemon request")?;
-    if read == 0 {
-        return Ok(());
-    }
-
-    let request = serde_json::from_str::<DaemonRequest>(&line).context("invalid daemon request")?;
-    let (response_tx, response_rx) = oneshot::channel();
-    command_tx
-        .send(CommandMessage {
-            request,
-            response_tx,
-        })
-        .map_err(|_| eyre::eyre!("daemon command channel closed"))?;
-    let response = response_rx
-        .await
-        .map_err(|_| eyre::eyre!("daemon response channel closed"))?;
-    let response = serde_json::to_vec(&response).context("failed to serialize daemon response")?;
-    write_half
-        .write_all(&response)
-        .await
-        .context("failed to write daemon response")?;
-    write_half
-        .write_all(b"\n")
-        .await
-        .context("failed to finish daemon response")?;
-    Ok(())
-}
-
 fn daemon_bind_addr() -> Result<SocketAddr> {
-    match std::env::var("ARKAMA_DAEMON_ADDR") {
-        Ok(addr) => addr
-            .parse()
-            .with_context(|| format!("failed to parse ARKAMA_DAEMON_ADDR: {addr}")),
+    let addr: SocketAddr = match std::env::var("ARKAMA_DAEMON_ADDR") {
+        Ok(addr) => addr.parse().context("invalid ARKAMA_DAEMON_ADDR"),
         Err(std::env::VarError::NotPresent) => {
             Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
         }
-        Err(err) => Err(err).context("failed to read ARKAMA_DAEMON_ADDR"),
+        Err(error) => Err(error).context("failed to read ARKAMA_DAEMON_ADDR"),
+    }?;
+    if !addr.ip().is_loopback() {
+        return Err(eyre::eyre!(
+            "remote binding requires the secure server; this local transport only accepts loopback"
+        ));
     }
+    Ok(addr)
 }
 
 fn write_daemon_addr(path: &PathBuf, addr: SocketAddr) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create daemon dir {parent:?}"))?;
+        std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, addr.to_string())
-        .with_context(|| format!("failed to write daemon address file {path:?}"))?;
+    std::fs::write(path, addr.to_string())?;
     Ok(())
 }
 
 fn read_daemon_addr() -> Result<SocketAddr> {
     match std::env::var("ARKAMA_DAEMON_ADDR") {
-        Ok(addr) => addr
+        Ok(addr) => addr.parse().context("invalid ARKAMA_DAEMON_ADDR"),
+        Err(std::env::VarError::NotPresent) => std::fs::read_to_string(daemon_addr_path()?)
+            .context("daemon address unavailable")?
+            .trim()
             .parse()
-            .with_context(|| format!("failed to parse ARKAMA_DAEMON_ADDR: {addr}")),
-        Err(std::env::VarError::NotPresent) => {
-            let path = daemon_addr_path()?;
-            let addr = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read daemon address file {path:?}"))?;
-            let addr = addr.trim();
-            addr.parse()
-                .with_context(|| format!("failed to parse daemon address from {path:?}: {addr}"))
-        }
-        Err(err) => Err(err).context("failed to read ARKAMA_DAEMON_ADDR"),
+            .context("invalid daemon address"),
+        Err(error) => Err(error).context("failed to read ARKAMA_DAEMON_ADDR"),
     }
 }

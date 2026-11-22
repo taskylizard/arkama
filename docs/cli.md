@@ -114,12 +114,30 @@ arkama-cli daemon stop
 Replace `1` with the ID returned when adding a job. `daemon run` runs the daemon in the foreground.
 By default, it binds to an available loopback port and writes its address to the application data directory.
 Queued requests survive daemon restarts; interrupted active requests are requeued on startup.
-Current job control messages describe requested actions, not a new acknowledged lifecycle contract.
+Pause/cancel responses acknowledge joined workers and durable state. `pausing`/`cancelling` mean a
+request is still being completed. A transfer that has already published may finish instead.
 Queue names and priority fields exist, but scheduling currently claims queued jobs by insertion order.
 
+### Shared manager and no-server operation
+
+```sh
+arkama-cli manage '{"op":"status"}'
+arkama-cli manage '{"op":"list","limit":20,"offset":0,"query":"example.com"}'
+arkama-cli manage '{"op":"set_setting","key":"max_concurrent","value":"2"}'
+arkama-cli manage --no-server '{"op":"status"}'
+arkama-cli daemon run --no-server
+```
+
+`manage` emits JSON and shares the exact local/server manager commands. `--no-server` opens no
+control listener, requires exclusive store ownership, and stops/checkpoints before the command
+exits; it cannot control a manager owned by another process. `daemon run --no-server` keeps that
+local host running until Ctrl+C. See the [lifecycle contract](../crates/arkama_manager/README.md).
+Managed jobs reserve output paths at admission and use URL basename inference; direct core downloads
+still prefer HTTP filenames. Search pagination is bounded through `manage`, including filtered pages.
+
 `ARKAMA_DATA_DIR` overrides the application data directory containing `arkama.sqlite`, `daemon.addr`,
-and `daemon.log`. `ARKAMA_DAEMON_ADDR` overrides the daemon bind/client address. An override can expose
-the listener beyond loopback without adding authentication, so do not use a public bind address.
+and `daemon.log`. `ARKAMA_DAEMON_ADDR` overrides the daemon bind/client address. Non-loopback binding
+is refused until the secure server contract is implemented; do not expose this transport through a proxy.
 
 ## Shell completions
 

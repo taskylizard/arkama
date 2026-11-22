@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/arkama_core",
   "crates/arkama_data",
+  "crates/arkama_manager",
   "crates/arkama",
 ]
 

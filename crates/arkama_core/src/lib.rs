@@ -10,11 +10,13 @@ mod request;
 mod segment;
 mod task;
 
-pub use downloader::{DownloadSession, download, start_download, start_download_with_handle};
+pub use downloader::{
+    DownloadSession, discard_partial, download, start_download, start_download_with_handle,
+};
 pub use error::{Error, Result};
 pub use observation::{
-    Diagnostics, DiagnosticsConfig, DiagnosticsSnapshot, DownloadObservation, ObservationSnapshot,
-    SpeedSample,
+    Diagnostics, DiagnosticsConfig, DiagnosticsSnapshot, DownloadMetadata, DownloadObservation,
+    ObservationSnapshot, SpeedSample,
 };
 pub use recovery::RecoveryPolicy;
 pub use request::{DEFAULT_CONNECTIONS, DownloadRequest, DownloadRequestBuilder};

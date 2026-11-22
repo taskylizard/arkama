@@ -14,6 +14,7 @@ path = "src/bin/arkama-cli.rs"
 [dependencies]
 arkama_core = { path = "../arkama_core" }
 arkama_data = { path = "../arkama_data" }
+arkama_manager = { path = "../arkama_manager" }
 bytefmt.workspace = true
 clap.workspace = true
 eyre.workspace = true
@@ -32,4 +33,5 @@ owo-colors = "4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"

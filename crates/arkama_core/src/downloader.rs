@@ -20,6 +20,16 @@ mod worker;
 pub(crate) use control::StopSignal;
 use engine::download_inner;
 
+/// Discards partial artifacts only while holding output ownership. Never deletes a final file.
+/// Call only for an output owned by the caller; an active attempt or existing final file refuses.
+pub fn discard_partial(output: &std::path::Path) -> Result<()> {
+    let _ownership = output::lock_output(output).map_err(map_download_error)?;
+    let partial = output::sidecar_path(output, ".arkama.part").map_err(map_download_error)?;
+    output::remove_if_exists(&state::state_path(&partial).map_err(map_download_error)?)
+        .map_err(map_download_error)?;
+    output::remove_if_exists(&partial).map_err(map_download_error)
+}
+
 /// Shared recovery admission for downloads owned by one host application.
 ///
 /// Reuse a session across jobs to share rolling per-origin retry budgets. Separate sessions and
