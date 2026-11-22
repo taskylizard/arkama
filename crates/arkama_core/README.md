@@ -59,6 +59,12 @@ The CLI translates Ctrl+C into a pause request.
 - `Finished { summary }`
 - `Failed { message }`
 
+Progress is sampled at most once every 500 ms per download, shared across all workers, so the CLI
+does not queue or render an update for every chunk. The first progress sample and lifecycle events
+are immediate; intermediate samples are skipped without making workers wait. Completion still
+reports the exact final byte count through `join`. The event channel remains unbounded, so an
+indefinitely stalled reader can still accumulate these low-rate updates.
+
 Pause and cancellation are surfaced as typed completion errors from `DownloadHandle::join`:
 `Error::Paused` and `Error::Cancelled`.
 

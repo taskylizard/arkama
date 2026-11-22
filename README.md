@@ -168,6 +168,8 @@ Should I use this? Nope.
   Requests use identity encoding; compressed HTTP responses are explicitly rejected.
 - Ctrl+C is handled by the CLI, not the core library. See the [core API contract](crates/arkama_core/README.md)
   for controls, feature-dependent resume behavior, and compatibility notes.
+- Downloaded size and speed updates are sampled at most every 500 ms per download rather than
+  every chunk, including JSON progress. The initial update and final result are immediate.
 
 ## 📌 Examples
 

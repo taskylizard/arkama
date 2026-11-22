@@ -2,6 +2,8 @@ use crate::api::{
     DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary,
 };
 use crate::error::{Error, Result};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 
@@ -66,9 +68,14 @@ pub fn start_download_with_handle(
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
     let join_stop_tx = stop_tx.clone();
     let join = handle.spawn(async move {
-        download_inner(request, Some(tx), join_stop_tx, stop_rx)
-            .await
-            .map_err(map_download_error)
+        download_inner(
+            request,
+            Some(Arc::new(EventSender::new(tx))),
+            join_stop_tx,
+            stop_rx,
+        )
+        .await
+        .map_err(map_download_error)
     });
     Ok(DownloadHandle {
         events: rx,
@@ -129,15 +136,46 @@ fn map_download_error(err: eyre::Report) -> Error {
     Error::DownloadFailed { message }
 }
 
-fn send_event(events: &Option<mpsc::UnboundedSender<DownloadEvent>>, event: DownloadEvent) {
+struct EventSender {
+    sender: mpsc::UnboundedSender<DownloadEvent>,
+    last_progress: Mutex<Option<Instant>>,
+}
+
+impl EventSender {
+    fn new(sender: mpsc::UnboundedSender<DownloadEvent>) -> Self {
+        Self {
+            sender,
+            last_progress: Mutex::new(None),
+        }
+    }
+}
+
+fn send_event(events: &Option<Arc<EventSender>>, event: DownloadEvent) {
     let Some(sender) = events.as_ref() else {
         return;
     };
-    let _ = sender.send(event);
+    if sender.sender.is_closed() {
+        return;
+    }
+    if matches!(event, DownloadEvent::Progress { .. }) {
+        // Skip optional samples on contention; workers never wait for reporting.
+        let Ok(mut last_progress) = sender.last_progress.try_lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if last_progress.is_some_and(|last| now.duration_since(last) < Duration::from_millis(500)) {
+            return;
+        }
+        *last_progress = Some(now);
+        let _ = sender.sender.send(event);
+    } else {
+        let _ = sender.sender.send(event);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::EventSender;
     use super::output::determine_output;
     use super::send_event;
     #[cfg(feature = "serde")]
@@ -149,6 +187,7 @@ mod tests {
     use crate::segment::Segment;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     #[cfg(feature = "serde")]
     use tokio::sync::Mutex as TokioMutex;
@@ -254,7 +293,7 @@ mod tests {
             message: "boom".to_string(),
         };
 
-        send_event(&Some(tx), event);
+        send_event(&Some(Arc::new(EventSender::new(tx))), event);
         let received = rx.blocking_recv().expect("event");
         let DownloadEvent::Failed { message } = received else {
             panic!("unexpected event");

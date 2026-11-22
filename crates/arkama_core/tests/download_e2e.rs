@@ -412,6 +412,43 @@ async fn optional_event_reader_does_not_determine_completion() {
 }
 
 #[tokio::test]
+async fn progress_is_sampled_across_workers_without_losing_completion() {
+    let data = asymmetric_data(1_048_579);
+    for connections in [1, 4] {
+        let mut config = FlakyServerConfig::new(data.clone());
+        config.chunk_size = 1024;
+        config.chunk_delay = Duration::from_millis(5);
+        let server = FlakyServer::spawn(config).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sampled.bin");
+        let mut handle = start_download(request(server.url(), path.clone(), connections)).unwrap();
+        let mut progress_count = 0;
+        let mut finished_bytes = None;
+        while let Some(event) = handle.events.recv().await {
+            match event {
+                DownloadEvent::Progress { .. } => progress_count += 1,
+                DownloadEvent::Finished { summary } => {
+                    finished_bytes = Some(summary.downloaded_bytes);
+                }
+                _ => {}
+            }
+        }
+        let summary = handle.join.await.unwrap().unwrap();
+        assert!(
+            progress_count >= 2,
+            "progress must continue during a transfer"
+        );
+        assert!(
+            progress_count <= 1 + summary.elapsed.as_millis() / 500,
+            "progress must be limited per download, not per chunk or worker: {progress_count}"
+        );
+        assert_eq!(finished_bytes, Some(data.len() as u64));
+        assert_eq!(summary.downloaded_bytes, data.len() as u64);
+        assert_downloaded(&path, &data).await;
+    }
+}
+
+#[tokio::test]
 async fn download_single_throttled_without_ranges() {
     let data = vec![42u8; 512 * 1024];
     let mut config = FlakyServerConfig::new(data.clone());

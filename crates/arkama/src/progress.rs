@@ -1,14 +1,11 @@
 use std::path::Path;
 
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 use crate::util::{format_duration, format_speed};
 
 pub fn build_progress(total: Option<u64>, output: &Path) -> ProgressBar {
-    let progress = match total {
-        Some(size) => ProgressBar::new(size),
-        None => ProgressBar::new_spinner(),
-    };
+    let progress = ProgressBar::with_draw_target(total, ProgressDrawTarget::stderr_with_hz(2));
 
     let style = match total {
         Some(_) => ProgressStyle::with_template(

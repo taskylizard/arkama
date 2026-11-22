@@ -4,21 +4,21 @@ use super::output::{
 };
 use super::plan::{DownloadPlan, DownloadPlanConfig};
 use super::rate_limit::SpeedLimiter;
-use super::send_event;
 use super::state::{load_state, state_path};
+use super::{EventSender, send_event};
 use crate::api::{DownloadEvent, DownloadRequest, DownloadSummary};
 use crate::http::{self, ClientFactory};
 use eyre::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{info, warn};
 use url::Url;
 
 pub(super) async fn download_inner(
     request: DownloadRequest,
-    events: Option<mpsc::UnboundedSender<DownloadEvent>>,
+    events: Option<Arc<EventSender>>,
     _keep_controls_alive: watch::Sender<StopSignal>,
     mut stop_rx: watch::Receiver<StopSignal>,
 ) -> Result<DownloadSummary> {

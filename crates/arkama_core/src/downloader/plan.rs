@@ -1,3 +1,4 @@
+use super::EventSender;
 use super::control::{StopSignal, wait_workers};
 use super::output::{prepare_output, remove_if_exists};
 use super::rate_limit::SpeedLimiter;
@@ -6,7 +7,6 @@ use super::worker::{
     DownloadSegmentContext, DownloadSingleContext, RangeUnsupported, SlowestTracker,
     download_segment, download_single,
 };
-use crate::api::DownloadEvent;
 use crate::http::{ClientFactory, HttpMeta};
 use crate::segment::{Segment, build_segments, build_segments_with_chunk_size};
 use eyre::Result;
@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Mutex as TokioMutex, mpsc, watch};
+use tokio::sync::{Mutex as TokioMutex, watch};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -30,7 +30,7 @@ pub(crate) struct DownloadPlan {
     connections: usize,
     client_factory: ClientFactory,
     speed_limiter: Option<Arc<SpeedLimiter>>,
-    events: Option<mpsc::UnboundedSender<DownloadEvent>>,
+    events: Option<Arc<EventSender>>,
     total_downloaded: Arc<AtomicU64>,
     stop_rx: watch::Receiver<StopSignal>,
 }
@@ -44,7 +44,7 @@ pub(crate) struct DownloadPlanConfig {
     pub(crate) experimental_entropy: bool,
     pub(crate) client_factory: ClientFactory,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
-    pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
+    pub(crate) events: Option<Arc<EventSender>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
 }

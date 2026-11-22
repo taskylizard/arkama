@@ -1,8 +1,8 @@
 use super::control::{StopSignal, controlled};
 use super::output::ensure_parent_dir;
 use super::rate_limit::SpeedLimiter;
-use super::send_event;
 use super::state::{DownloadState, update_state};
+use super::{EventSender, send_event};
 use crate::api::DownloadEvent;
 use crate::http::{self, ClientFactory, HttpMeta};
 use crate::segment::Segment;
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions as AsyncOpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio::sync::{Mutex as TokioMutex, mpsc, watch};
+use tokio::sync::{Mutex as TokioMutex, watch};
 use url::Url;
 
 #[derive(Debug)]
@@ -83,7 +83,7 @@ pub(crate) struct DownloadSegmentContext {
     pub(crate) slow_tracker: Option<Arc<Mutex<SlowestTracker>>>,
     pub(crate) meta: HttpMeta,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
-    pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
+    pub(crate) events: Option<Arc<EventSender>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
     pub(crate) total_size: Option<u64>,
 }
@@ -95,7 +95,7 @@ pub(crate) struct DownloadSingleContext {
     pub(crate) output: PathBuf,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
-    pub(crate) events: Option<mpsc::UnboundedSender<DownloadEvent>>,
+    pub(crate) events: Option<Arc<EventSender>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
     pub(crate) total_size: Option<u64>,
 }

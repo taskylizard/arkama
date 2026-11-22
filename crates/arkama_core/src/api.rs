@@ -219,6 +219,9 @@ impl From<DownloadRequestBuilder> for DownloadRequest {
 
 /// Reports lifecycle updates for a download.
 ///
+/// Progress is sampled at most once every 500 ms per download, shared across workers.
+/// The first sample and lifecycle events are immediate; completion is authoritative through `join`.
+///
 /// # Examples
 ///
 /// ```no_run

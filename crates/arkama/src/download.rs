@@ -263,7 +263,7 @@ async fn run_single_console(db: &Db, request: DownloadRequest, url: &str) -> Res
                     }
                     DownloadEvent::Progress { downloaded_bytes, total_bytes } => {
                         if let Some(bar) = progress.as_ref() {
-                            if let Some(total) = total_bytes {
+                            if let Some(total) = total_bytes.filter(|total| bar.length() != Some(*total)) {
                                 bar.set_length(total);
                             }
                             bar.set_position(downloaded_bytes);
