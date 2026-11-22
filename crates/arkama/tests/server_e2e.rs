@@ -363,7 +363,7 @@ async fn credential_free_mode_cannot_relax_destination_or_path_boundaries() {
     assert_eq!(source.stats().full_get_requests, 0);
     assert_eq!(source.stats().range_get_requests, 0);
     server.stop().await;
-    let options = [
+    let options = vec![
         "--no-auth".into(),
         "--allow-private-source".into(),
         url::Url::parse(&source.url())
@@ -371,6 +371,19 @@ async fn credential_free_mode_cannot_relax_destination_or_path_boundaries() {
             .origin()
             .ascii_serialization(),
     ];
+    // An owner-selected root can have an aliased parent (like macOS /var). Client paths
+    // using that spelling must work, without granting permission to links below the root.
+    #[cfg(unix)]
+    let (options, request) = {
+        let mut options = options;
+        let alias = dir.path().join("root-alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        options.extend([
+            "--download-root".into(),
+            alias.join("out").to_str().unwrap().into(),
+        ]);
+        (options, request.output(alias.join("out/file.bin")))
+    };
     server = Server::start(dir.path(), &options).await;
     for bad in [
         dir.path().join("outside.bin"),
@@ -400,7 +413,13 @@ async fn credential_free_mode_cannot_relax_destination_or_path_boundaries() {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(dir.path().join("state"), dir.path().join("out/link")).unwrap();
-        assert_eq!(server.command(json!({"op":"enqueue","request":request.clone().output(dir.path().join("out/link/escaped.bin"))})).await.0, StatusCode::FORBIDDEN);
+        for bad in [
+            "out/link/escaped.bin",
+            "root-alias/out/link/escaped.bin",
+            "root-alias/out/../escape.bin",
+        ] {
+            assert_eq!(server.command(json!({"op":"enqueue","request":request.clone().output(dir.path().join(bad))})).await.0, StatusCode::FORBIDDEN);
+        }
     }
     let mut unsupported = serde_json::to_value(&request).unwrap();
     unsupported["method"] = json!("POST");

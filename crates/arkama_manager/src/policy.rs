@@ -10,6 +10,7 @@ use crate::{Error, Result};
 #[derive(Clone, Default)]
 pub struct ManagerPolicy {
     pub(crate) roots: Vec<PathBuf>,
+    root_aliases: Vec<PathBuf>,
     pub(crate) destination: DestinationPolicy,
 }
 
@@ -20,7 +21,12 @@ impl ManagerPolicy {
             return Err(Error::new("invalid", "select 1–16 output roots"));
         }
         let mut canonical = Vec::new();
+        let mut aliases = Vec::new();
         for root in roots {
+            aliases.push(
+                std::path::absolute(&root)
+                    .map_err(|_| Error::new("invalid", "cannot resolve output root"))?,
+            );
             let root = root
                 .canonicalize()
                 .map_err(|_| Error::new("invalid", "output root must exist"))?;
@@ -31,6 +37,7 @@ impl ManagerPolicy {
         }
         Ok(Self {
             roots: canonical,
+            root_aliases: aliases,
             destination: DestinationPolicy::public_only(private_origins)
                 .map_err(|_| Error::new("invalid", "invalid private-source origins"))?,
         })
@@ -47,32 +54,25 @@ impl ManagerPolicy {
                 .map_err(|_| Error::new("storage", "cannot resolve current directory"))?
                 .join(path)
         };
-        // Canonical Windows roots use verbatim prefixes; ordinary absolute client paths do not.
-        #[cfg(windows)]
-        let path = {
-            let text = path.to_string_lossy();
-            if text.starts_with(r"\\?\") {
-                path
-            } else if let Some(unc) = text.strip_prefix(r"\\") {
-                PathBuf::from(format!(r"\\?\UNC\{unc}"))
-            } else {
-                PathBuf::from(format!(r"\\?\{text}"))
-            }
-        };
         if path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
         {
             return Err(Error::new("forbidden", "parent traversal is not allowed"));
         }
-        let root = self
+        // Accept the owner's original spelling (macOS /var, Windows normal prefixes/separators)
+        // as well as the canonical spelling. Walk only from the retained canonical root;
+        // canonicalizing a client path first would silently follow links below that root.
+        let (root, prefix) = self
             .roots
             .iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.components().count())
+            .zip(&self.root_aliases)
+            .flat_map(|(root, alias)| [(root, root), (root, alias)])
+            .filter(|(_, prefix)| path.starts_with(prefix))
+            .max_by_key(|(_, prefix)| prefix.components().count())
             .ok_or_else(|| Error::new("forbidden", "output is outside authorized roots"))?;
         let mut current = root.clone();
-        for component in path.strip_prefix(root).expect("root prefix").components() {
+        for component in path.strip_prefix(prefix).expect("root prefix").components() {
             if let Component::Normal(name) = component {
                 validate_filename(
                     name.to_str()
