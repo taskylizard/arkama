@@ -5,7 +5,7 @@ use futures_util::{Stream, StreamExt};
 use reqwest::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_ENCODING,
     CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderValue, IF_RANGE,
-    LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE, REFERER, RETRY_AFTER,
+    LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE, REFERER, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::redirect::Policy;
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -41,6 +41,8 @@ impl HttpMeta {
 #[derive(Clone)]
 pub(crate) struct ClientFactory {
     base: Client,
+    headers: HeaderMap,
+    credential_origin: url::Origin,
     pub(crate) recovery: RecoveryPolicy,
     budget: Arc<RetryBudget>,
     destination: crate::DestinationPolicy,
@@ -74,20 +76,22 @@ impl Response {
 impl ClientFactory {
     pub(crate) fn new(
         user_agent: Option<&str>,
+        context: &crate::RequestContext,
         experimental_entropy: bool,
         recovery: RecoveryPolicy,
         url: &Url,
         session: crate::DownloadSession,
     ) -> Result<Self> {
         session.destination.validate(url)?;
-        let base = build_client(
-            user_agent,
-            experimental_entropy,
-            &recovery,
-            session.destination.clone(),
-        )?;
+        let base = build_client(experimental_entropy, &recovery, session.destination.clone())?;
+        let mut headers = context.headers();
+        let mut agent = HeaderValue::from_str(user_agent.unwrap_or("arkama/0.1"))?;
+        agent.set_sensitive(true);
+        headers.insert(USER_AGENT, agent);
         Ok(Self {
             base,
+            headers,
+            credential_origin: url.origin(),
             recovery,
             budget: session.budget,
             destination: session.destination,
@@ -98,6 +102,9 @@ impl ClientFactory {
 
     async fn send(&self, request: RequestBuilder) -> Result<Response> {
         let mut request = request.build().map_err(|error| error.without_url())?;
+        if request.url().origin() == self.credential_origin {
+            request.headers_mut().extend(self.headers.clone());
+        }
         let mut remaining = Duration::from_millis(self.recovery.setup_timeout_ms);
         for hop in 0..=10 {
             self.destination.validate(request.url())?;
@@ -125,7 +132,13 @@ impl ClientFactory {
                 .and_then(|value| response.url().join(value).ok())
                 .ok_or_else(|| eyre::eyre!("missing or invalid redirect destination"))?;
             self.destination.validate(&next)?;
+            if request.url().scheme() == "https" && next.scheme() != "https" {
+                return Err(eyre::eyre!("HTTPS redirect downgrade is not allowed"));
+            }
             if next.origin() != request.url().origin() {
+                for header in self.headers.keys() {
+                    request.headers_mut().remove(header);
+                }
                 for header in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, REFERER] {
                     request.headers_mut().remove(header);
                 }
@@ -277,16 +290,13 @@ where
 }
 
 fn build_client(
-    user_agent: Option<&str>,
     experimental_entropy: bool,
     recovery: &RecoveryPolicy,
     destination: crate::DestinationPolicy,
 ) -> Result<Client> {
-    let user_agent = user_agent.unwrap_or("arkama/0.1");
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let mut builder = Client::builder()
-        .user_agent(user_agent)
         .connect_timeout(Duration::from_millis(recovery.connect_timeout_ms))
         .default_headers(headers)
         .no_gzip()

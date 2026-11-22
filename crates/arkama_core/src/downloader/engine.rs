@@ -36,17 +36,20 @@ pub(super) async fn download_inner(
         limit,
         experimental_entropy,
         recovery,
+        context,
     } = request;
+    let identity = context.identity(&url, user_agent.as_deref());
     let url = Url::parse(&url).context("invalid url")?;
     let mut client_factory = ClientFactory::new(
         user_agent.as_deref(),
+        &context,
         experimental_entropy,
         recovery,
         &url,
         session,
     )?;
     let mut attempts = 0;
-    let meta = loop {
+    let mut meta = loop {
         match controlled(&mut stop_rx, http::probe(&client_factory, &url)).await {
             Ok(meta) => break meta,
             Err(error) => {
@@ -61,14 +64,17 @@ pub(super) async fn download_inner(
             }
         }
     };
+    if let Some(filename) = &context.filename {
+        meta.filename = Some(filename.clone());
+    }
     client_factory.origin = Url::parse(&meta.final_url)?.origin().ascii_serialization();
     send_event(
         &events,
         DownloadEvent::Metadata {
-            etag: meta.etag.clone(),
+            etag: meta.etag.as_deref().map(crate::context::digest),
             last_modified: meta.last_modified.clone(),
             mime_type: meta.mime_type.clone(),
-            final_url: meta.final_url.clone(),
+            final_url: crate::redact_url(&meta.final_url),
         },
     );
     let output = determine_output(&url, &meta, output, output_dir)?;
@@ -80,13 +86,14 @@ pub(super) async fn download_inner(
     let metadata = DownloadMetadata {
         output: output.clone(),
         total_bytes: meta.size,
-        etag: meta.etag.clone(),
+        etag: meta.etag.as_deref().map(crate::context::digest),
         last_modified: meta.last_modified.clone(),
         mime_type: meta.mime_type.clone(),
-        final_url: meta.final_url.clone(),
+        final_url: crate::redact_url(&meta.final_url),
     };
     let mut plan = DownloadPlan::new(DownloadPlanConfig {
         url,
+        identity,
         output: partial.clone(),
         meta,
         connections: connections.max(1),

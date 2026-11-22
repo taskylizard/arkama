@@ -4,7 +4,7 @@
 
 A download manager written in Rust, with a reusable HTTP engine, a CLI, and a local background daemon.
 
-[CLI guide](docs/cli.md) · [Rust API](crates/arkama_core/README.md) · [Server API](docs/server.md) · [Development](docs/development.md)
+[CLI guide](docs/cli.md) · [Rust API](crates/arkama_core/README.md) · [Server API](docs/server.md) · [Client examples](docs/clients.md) · [Development](docs/development.md)
 
 > [!WARNING]
 > Arkama is in early development. The reliable core milestone has landed, but the full core/server
@@ -44,6 +44,8 @@ or `arkama-cli download --help` for download options.
   controls, output reservations, live settings, and bounded paginated history.
 - Named queues, priority/order controls, shared host/bandwidth limits, folder rules, batches and
   timezone-aware download windows. See [download management](docs/management.md).
+- Ordinary GET handoffs with protected headers/cookies/referrer, credential-scoped redirects,
+  and durable duplicate-safe client IDs. See [client inputs and examples](docs/clients.md).
 
 The daemon exposes a bounded [single-owner HTTP/JSON API](docs/server.md), with safe local defaults.
 The experimental connection-entropy option is opt-in for bonded LACP/ECMP setups, not a general
@@ -90,12 +92,12 @@ documentation, and feature/MSRV checks.
 ## Next milestones
 
 The reliability/safe-core API, bounded observations, configurable recovery, shared-manager,
-secure-server and download-management milestones are implemented. See the [manager contract](crates/arkama_manager/README.md).
+secure-server, download-management and protected-client-input milestones are implemented.
+See the [manager contract](crates/arkama_manager/README.md).
 Optional diagnostics use a dedicated OS thread; slow observers cannot back up the transfer path.
 
 The remaining foundation work is:
 
-7. Credential-safe browser request context and duplicate-safe client handoff.
 8. Combined cross-platform, fault, security, and performance validation for a foundation release.
 
 Browser extensions, desktop/Android clients, video support, and measured acceleration remain later work.

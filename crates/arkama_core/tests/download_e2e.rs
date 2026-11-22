@@ -19,6 +19,7 @@ fn request(url: String, path: PathBuf, connections: usize) -> DownloadRequest {
         limit: None,
         experimental_entropy: false,
         recovery: Default::default(),
+        context: Default::default(),
     }
 }
 
@@ -1167,4 +1168,139 @@ async fn shared_limits_cover_bodies_redirects_bandwidth_and_live_changes() {
         .unwrap()
         .unwrap();
     assert_downloaded(&dir.path().join("live.bin"), &data).await;
+}
+
+#[cfg(feature = "serde")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_context_is_validated_redacted_and_scoped_to_its_origin() {
+    use arkama_core::RequestContext;
+    let data: Vec<u8> = (0..262_147)
+        .map(|i| ((i * 37 + i / 251) % 256) as u8)
+        .collect();
+    let headers = vec![
+        ("cookie".into(), "session=cookie-secret".into()),
+        ("authorization".into(), "Bearer header-secret".into()),
+        ("x-download-token".into(), "custom-secret".into()),
+        (
+            "referer".into(),
+            "https://example.com/page?ref=referrer-secret".into(),
+        ),
+    ];
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 1024;
+    config.chunk_delay = Duration::from_millis(2);
+    config.required_headers = headers.clone();
+    let source = FlakyServer::spawn(config.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut context = RequestContext {
+        cookies: Some(headers[0].1.clone()),
+        headers: [headers[1].clone(), headers[2].clone()].into(),
+        referrer: Some(format!("{}#fragment-secret", headers[3].1)),
+        source: Some("https://example.com/source?private=source-secret".into()),
+        filename: Some("selected.bin".into()),
+        ..RequestContext::default()
+    };
+    let request = DownloadRequest::new(format!("{}?token=query-secret", source.url()))
+        .output_dir(dir.path())
+        .context(context.clone());
+    let secrets = [
+        "cookie-secret",
+        "header-secret",
+        "custom-secret",
+        "referrer-secret",
+        "query-secret",
+        "source-secret",
+        "fragment-secret",
+    ];
+    for secret in secrets {
+        assert!(!format!("{request:?}").contains(secret));
+    }
+    let failed =
+        download(DownloadRequest::new(request.url.clone()).output(dir.path().join("denied.bin")))
+            .await
+            .unwrap_err();
+    assert!(failed.to_string().contains("403"));
+    for secret in secrets {
+        assert!(!format!("{failed:?}").contains(secret));
+    }
+    let before = source.stats();
+    for invalid in [
+        RequestContext {
+            method: "POST".into(),
+            ..context.clone()
+        },
+        RequestContext {
+            headers: [("Range".into(), "bytes=0-10".into())].into(),
+            ..context.clone()
+        },
+        RequestContext {
+            cookies: Some("bad\r\nHost: evil".into()),
+            ..context.clone()
+        },
+    ] {
+        assert!(start_download(request.clone().context(invalid)).is_err());
+    }
+    assert_eq!(source.stats().head_requests, before.head_requests);
+    let path = dir.path().join("selected.bin");
+    let mut handle = start_download(request.clone()).unwrap();
+    wait_for_progress(&mut handle.events).await;
+    handle.control.pause();
+    assert!(handle.join.await.unwrap().unwrap_err().is_paused());
+    let checkpoint = std::fs::read_to_string(state_path(&path)).unwrap();
+    let metadata = format!("{:?}", handle.observation.metadata());
+    for secret in secrets {
+        assert!(!checkpoint.contains(secret));
+        assert!(!metadata.contains(secret));
+    }
+    let summary = download(request.clone()).await.unwrap();
+    assert!(summary.resumed_bytes > 0);
+    assert_downloaded(&path, &data).await;
+
+    // An account/context change must invalidate reusable bytes even with the same URL/ETag/size.
+    let second = request.clone().output(dir.path().join("account.bin"));
+    let mut handle = start_download(second.clone()).unwrap();
+    wait_for_progress(&mut handle.events).await;
+    handle.control.pause();
+    assert!(handle.join.await.unwrap().unwrap_err().is_paused());
+    let replacement: Vec<u8> = data.iter().map(|byte| byte.wrapping_add(71)).collect();
+    config.data = replacement.clone();
+    config.required_headers[0].1 = "session=other-account".into();
+    source.configure(config.clone());
+    context.cookies = Some(config.required_headers[0].1.clone());
+    let summary = download(second.context(context)).await.unwrap();
+    assert_eq!(summary.resumed_bytes, 0);
+    assert_downloaded(&dir.path().join("account.bin"), &replacement).await;
+
+    let mut redirect = FlakyServerConfig::new(data.clone());
+    redirect.required_headers = headers.clone();
+    redirect.redirect_path = Some("/file.bin".into());
+    redirect.redirect = Some("/landing".into());
+    source.configure(redirect.clone());
+    download(request.clone().output(dir.path().join("same-origin.bin")))
+        .await
+        .unwrap();
+    assert_downloaded(&dir.path().join("same-origin.bin"), &data).await;
+    let mut target_config = FlakyServerConfig::new(data.clone());
+    target_config.forbidden_headers = headers
+        .iter()
+        .map(|(name, _)| name.clone())
+        .chain(["user-agent".into()])
+        .collect();
+    let target = FlakyServer::spawn(target_config.clone()).await;
+    redirect.required_header_path = Some("/file.bin".into());
+    redirect.redirect = Some(target.url());
+    source.configure(redirect.clone());
+    download(request.clone().output(dir.path().join("other-origin.bin")))
+        .await
+        .unwrap();
+    assert_downloaded(&dir.path().join("other-origin.bin"), &data).await;
+    redirect.forbidden_headers = target_config.forbidden_headers.clone();
+    redirect.forbidden_header_path = Some("/landing".into());
+    source.configure(redirect);
+    target_config.redirect = Some(source.url().replace("file.bin", "landing"));
+    target.configure(target_config);
+    download(request.output(dir.path().join("redirect-back.bin")))
+        .await
+        .unwrap();
+    assert_downloaded(&dir.path().join("redirect-back.bin"), &data).await;
 }

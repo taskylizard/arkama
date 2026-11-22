@@ -28,6 +28,15 @@ impl Db {
     }
 
     fn migrate_downloads_table(&self) -> Result<()> {
+        for column in ["handoff_key", "handoff_hash"] {
+            if !self.downloads_column_exists(column)? {
+                self.conn.execute(
+                    &format!("ALTER TABLE downloads ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
+        }
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS downloads_handoff ON downloads(handoff_key) WHERE handoff_key IS NOT NULL", [])?;
         if !self.downloads_column_exists("queue_position")? {
             self.conn.execute(
                 "ALTER TABLE downloads ADD COLUMN queue_position INTEGER",

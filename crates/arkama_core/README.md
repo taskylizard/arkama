@@ -108,8 +108,8 @@ Unfinished bytes are stored separately from the requested final output:
 <output file name>.arkama.lock
 ```
 
-Start a later download with the same URL and output path to resume. Only version-1 checkpoints with
-matching source/final URL, strong ETag, total size, output identity, entropy settings, and valid
+Start a later download with the same URL, request context and output path to resume. Only version-2 checkpoints with
+matching hashed request/final identity, strong ETag, total size, output identity, entropy settings, and valid
 non-overlapping segment coverage can supply reusable positions. Missing, corrupt, old, incompatible,
 or out-of-bounds checkpoints cause a conservative restart. File length alone never proves progress.
 Weak ETags and Last-Modified alone are insufficient: these servers use a full stream and restart
@@ -129,6 +129,12 @@ publication. Automatic decompression is disabled and requests specify `Accept-En
 servers returning non-identity Content-Encoding are rejected, not decoded into ambiguous offsets.
 No external content hash is fetched or inferred: verification covers HTTP framing/identity and
 coverage, not protection from a server that lies about its ETag or bytes.
+
+Checkpoints store hashes instead of raw URLs/ETags. Version-1 checkpoints restart conservatively;
+old checkpoint files/backups may contain plaintext URLs. Metadata/events expose only a display
+origin (`/[redacted]`) and SHA-256 ETag fingerprint, not values suitable for replay or `If-Range`.
+Filenames, content types and last-modified values are ordinary file/response metadata, not secrets
+to store in request fields. Hosts must not place credentials in output paths or these fields.
 
 Only a verified, synchronized partial is published at the final name, atomically without overwriting.
 Publication requires a filesystem supporting hard links in the destination directory; on an
@@ -269,6 +275,33 @@ addresses and URL credentials, and recheck every redirect. Bounded private-sourc
 exact origins chosen by the host. Direct standalone functions remain unrestricted trusted-local
 use. See the [server boundary contract](../../docs/server.md); network policy is not a filesystem
 sandbox, and fully safe Rust consumers still own runtime/shutdown and output authorization.
+
+## Browser-style GET context
+
+```rust
+use arkama_core::{DownloadRequest, RequestContext};
+let context = RequestContext {
+    headers: [("accept".into(), "application/octet-stream".into())].into(),
+    filename: Some("selected.bin".into()),
+    ..Default::default()
+};
+let request = DownloadRequest::new("https://example.com/file").context(context);
+request.context.validate()?;
+# Ok::<(), arkama_core::Error>(())
+```
+
+Optional cookies, authorization/custom `x-*` headers and referrer apply only to the original
+scheme/hostname/port. An origin change strips all context/custom user-agent headers for the rest
+of that redirect chain, including a return to the source; HTTPS downgrades are refused. There is
+no cookie jar, arbitrary method/body replay, or URL-userinfo authentication. `source` is metadata
+only and is never sent to the download server. Context is part of checkpoint identity: changing
+credentials restarts conservatively, even with an unchanged URL/ETag/size.
+
+`Debug` redacts context, and public metadata uses display-only URL/ETag values. Request `Serialize`
+intentionally includes replay secrets for protected storage/transport; **never log request JSON**.
+Rust struct literals need `context: Default::default()`; old JSON defaults to ordinary GET context.
+The core has no secret store or retention service. A host using it directly owns those decisions;
+the [manager/client contract](../../docs/clients.md) protects persisted replay and defines bounds.
 
 ## Feature flags
 

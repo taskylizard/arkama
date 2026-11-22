@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,6 +35,11 @@ pub(crate) struct FlakyServerConfig {
     pub(crate) stall_after_bytes: usize,
     pub(crate) stall_duration: Duration,
     pub(crate) redirect: Option<String>,
+    pub(crate) redirect_path: Option<String>,
+    pub(crate) required_headers: Vec<(String, String)>,
+    pub(crate) forbidden_headers: Vec<String>,
+    pub(crate) required_header_path: Option<String>,
+    pub(crate) forbidden_header_path: Option<String>,
 }
 
 impl FlakyServerConfig {
@@ -66,6 +72,11 @@ impl FlakyServerConfig {
             stall_after_bytes: 4096,
             stall_duration: Duration::from_millis(200),
             redirect: None,
+            redirect_path: None,
+            required_headers: Vec::new(),
+            forbidden_headers: Vec::new(),
+            required_header_path: None,
+            forbidden_header_path: None,
         }
     }
 }
@@ -82,10 +93,12 @@ struct ByteRange {
     end: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HttpRequest {
     method: HttpMethod,
     range: Option<ByteRange>,
+    path: String,
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,7 +219,33 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
 
     let config = state.config.read().unwrap().clone();
     let get_attempt = full_get_attempt.or(range_get_attempt);
-    if let Some(location) = &config.redirect {
+    let context_path = config
+        .redirect_path
+        .as_ref()
+        .is_none_or(|path| path == &request.path);
+    if (config
+        .required_header_path
+        .as_ref()
+        .is_none_or(|path| path == &request.path)
+        && config
+            .required_headers
+            .iter()
+            .any(|(name, value)| request.headers.get(name) != Some(value)))
+        || (config
+            .forbidden_header_path
+            .as_ref()
+            .is_none_or(|path| path == &request.path)
+            && config
+                .forbidden_headers
+                .iter()
+                .any(|name| request.headers.contains_key(name)))
+    {
+        stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+    if let Some(location) = &config.redirect.as_ref().filter(|_| context_path) {
         stream.write_all(format!("HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\nLocation: {location}\r\n\r\n").as_bytes()).await?;
         return Ok(());
     }
@@ -446,6 +485,14 @@ fn parse_request(buffer: &[u8]) -> io::Result<HttpRequest> {
         }
     };
 
+    let path = parts
+        .next()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let mut headers = BTreeMap::new();
     let mut range = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -454,9 +501,15 @@ fn parse_request(buffer: &[u8]) -> io::Result<HttpRequest> {
         if name.eq_ignore_ascii_case("range") {
             range = parse_range(value.trim());
         }
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
     }
 
-    Ok(HttpRequest { method, range })
+    Ok(HttpRequest {
+        method,
+        range,
+        path,
+        headers,
+    })
 }
 
 fn parse_range(value: &str) -> Option<ByteRange> {

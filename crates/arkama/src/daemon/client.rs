@@ -8,7 +8,7 @@ use super::protocol::{DaemonRequest, DaemonResponse, DaemonStatus};
 use super::read_daemon_addr;
 
 pub(crate) async fn enqueue_download(request: DownloadRequest) -> Result<i64> {
-    let response = send_request(DaemonRequest::Enqueue(request.into())).await?;
+    let response = send_request(DaemonRequest::Enqueue(request)).await?;
     match response {
         DaemonResponse::Enqueued { id } if id >= 0 => Ok(id),
         DaemonResponse::Enqueued { .. } => Err(eyre::eyre!("daemon is stopping")),

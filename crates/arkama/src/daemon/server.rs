@@ -197,7 +197,7 @@ async fn handle(
     let result = if request.method() == Method::GET && path == "/v1/info" {
         response(
             StatusCode::OK,
-            json!({"api_version":1,"instance":state.instance,"authentication":if state.no_auth {"none"} else {"api_key"},"capabilities":["jobs","controls","settings","history","diagnostics","updates","queues","rules","batches","limits","schedules"],"limits":{"body_bytes":65536,"reply_bytes":2097152,"connections":32,"connections_per_second":64,"page_size":100,"batch_size":32}}),
+            json!({"api_version":1,"instance":state.instance,"authentication":if state.no_auth {"none"} else {"api_key"},"capabilities":["jobs","controls","settings","history","diagnostics","updates","queues","rules","batches","limits","schedules","request_context","handoff_ids","forget_request"],"limits":{"body_bytes":65536,"reply_bytes":2097152,"connections":32,"connections_per_second":64,"page_size":100,"batch_size":32}}),
         )
     } else if request.method() == Method::GET && path == "/v1/updates" {
         updates(&state, &query).await

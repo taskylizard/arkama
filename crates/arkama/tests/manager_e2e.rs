@@ -78,16 +78,23 @@ impl Host {
                 .await
                 .map_err(|error| error.to_string()),
             Self::Server { addr, key, .. } => {
-                let response = exchange(
-                    addr,
-                    key,
-                    serde_json::json!({"Manage": {"command": command}}),
-                )
-                .await;
-                if let Some(error) = response.get("Error") {
+                let response: serde_json::Value = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post(format!("http://{addr}/v1/commands"))
+                    .bearer_auth(key)
+                    .json(&command)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if let Some(error) = response.get("error") {
                     return Err(error.to_string());
                 }
-                Ok(serde_json::from_value(response["Managed"].clone()).unwrap())
+                Ok(serde_json::from_value(response).unwrap())
             }
         }
     }
@@ -870,4 +877,233 @@ fn chrono_minute() -> u32 {
         .unwrap()
         .as_secs();
     ((seconds / 60) % 1440) as u32
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_handoffs_are_durable_unique_and_reconnectable() {
+    use arkama_core::RequestContext;
+    use arkama_manager::{Queue, Submission};
+    let data: Vec<u8> = (0..262_147)
+        .map(|i| ((i * 41 + i / 257) % 256) as u8)
+        .collect();
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 1024;
+    config.chunk_delay = Duration::from_millis(3);
+    config.required_headers = vec![
+        ("cookie".into(), "session=cookie-secret".into()),
+        ("x-token".into(), "header-secret".into()),
+        (
+            "referer".into(),
+            "https://example.com/page?token=referrer-secret".into(),
+        ),
+    ];
+    let source = FlakyServer::spawn(config).await;
+    for server in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = Host::open(dir.path(), server, &source.url()).await;
+        let mut queue = Queue::new("browser");
+        queue.paused = true;
+        host.execute(Command::PutQueue {
+            queue: queue.clone(),
+        })
+        .await
+        .unwrap();
+        let context = RequestContext {
+            headers: [("x-token".into(), "header-secret".into())].into(),
+            cookies: Some("session=cookie-secret".into()),
+            referrer: Some("https://example.com/page?token=referrer-secret".into()),
+            filename: Some("chosen.bin".into()),
+            source: Some("https://example.com/source?token=source-secret".into()),
+            ..Default::default()
+        };
+        let mut submission = Submission::from(
+            DownloadRequest::new(format!("{}?token=query-secret", source.url()))
+                .output_dir(dir.path().join("out"))
+                .context(context),
+        );
+        submission.queue = "browser".into();
+        submission.handoff_id = Some("device_A-request_1".into());
+        let command = Command::Submit {
+            submission: submission.clone(),
+        };
+        let (a, b, c) = tokio::join!(
+            host.execute(command.clone()),
+            host.execute(command.clone()),
+            host.execute(command.clone())
+        );
+        let Response::Accepted { id } = a.unwrap() else {
+            panic!("missing acceptance")
+        };
+        for reply in [b.unwrap(), c.unwrap()] {
+            assert!(matches!(reply, Response::Accepted { id: other } if other == id));
+        }
+        let mut changed = submission.clone();
+        changed.request.context.cookies = Some("session=different".into());
+        assert!(
+            host.execute(Command::Submit {
+                submission: changed
+            })
+            .await
+            .unwrap_err()
+            .contains("conflict")
+        );
+        let mut unsupported = submission.clone();
+        unsupported.handoff_id = Some("unsupported".into());
+        unsupported.request.context.method = "POST".into();
+        assert!(
+            host.execute(Command::Submit {
+                submission: unsupported
+            })
+            .await
+            .unwrap_err()
+            .contains("GET")
+        );
+        let db_path = dir.path().join("state/arkama.sqlite");
+        let secrets = [
+            "cookie-secret",
+            "header-secret",
+            "referrer-secret",
+            "source-secret",
+            "query-secret",
+        ];
+        let db = Db::open_path(&db_path).unwrap();
+        assert_eq!(db.load_downloads("").unwrap().len(), 1);
+        assert_eq!(
+            db.load_daemon_request(id).unwrap().unwrap().context.cookies,
+            submission.request.context.cookies
+        );
+        for secret in secrets {
+            assert!(!String::from_utf8_lossy(&std::fs::read(&db_path).unwrap()).contains(secret));
+        }
+        drop(db);
+        assert!(host.execute(Command::ForgetRequest { id }).await.is_err());
+        host.stop().await;
+        host = Host::open(dir.path(), server, &source.url()).await;
+        assert!(
+            matches!(host.execute(command.clone()).await.unwrap(), Response::Accepted { id: other } if other == id)
+        );
+        queue.paused = false;
+        host.execute(Command::PutQueue { queue }).await.unwrap();
+        host.wait(id, |job| job.record.downloaded_bytes > 8192)
+            .await;
+        host.execute(Command::Pause { id }).await.unwrap();
+        let path = dir.path().join("out/chosen.bin");
+        let checkpoint =
+            std::fs::read_to_string(format!("{}.arkama.state", partial(&path).display())).unwrap();
+        let record = format!("{:?}", host.job(id).await);
+        for secret in secrets {
+            assert!(!checkpoint.contains(secret));
+            assert!(!record.contains(secret));
+        }
+        let Response::Diagnostics { .. } = host.execute(Command::Diagnostics { id }).await.unwrap()
+        else {
+            panic!("no diagnostic reply")
+        };
+        host.stop().await;
+        host = Host::open(dir.path(), server, &source.url()).await;
+        assert!(
+            matches!(host.execute(command.clone()).await.unwrap(), Response::Accepted { id: other } if other == id)
+        );
+        host.execute(Command::Resume { id }).await.unwrap();
+        host.wait(id, |job| job.record.status == "finished").await;
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert!(
+            Db::open_path(&db_path)
+                .unwrap()
+                .load_daemon_request(id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(host.execute(command).await.unwrap(), Response::Accepted { id: other } if other == id)
+        );
+
+        // Dropping completed replay credentials must not drop the output reservation.
+        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+        host.stop().await;
+        host = Host::open(dir.path(), server, &source.url()).await;
+        let mut repeated = submission.clone();
+        repeated.handoff_id = Some("another-request".into());
+        assert!(
+            host.execute(Command::Submit {
+                submission: repeated
+            })
+            .await
+            .unwrap_err()
+            .contains("reserved")
+        );
+
+        let mut failed = submission.clone();
+        failed.handoff_id = Some("device_A-failed".into());
+        failed.request.context.cookies = Some("session=expired".into());
+        failed.request.output = Some(dir.path().join("out/failed.bin"));
+        let Response::Accepted { id: failed_id } = host
+            .execute(Command::Submit { submission: failed })
+            .await
+            .unwrap()
+        else {
+            panic!("no failed-job acceptance")
+        };
+        let job = host
+            .wait(failed_id, |job| job.record.status == "failed")
+            .await;
+        assert!(job.record.error_message.unwrap().contains("403"));
+        assert!(
+            Db::open_path(&db_path)
+                .unwrap()
+                .load_daemon_request(failed_id)
+                .unwrap()
+                .is_some()
+        );
+        host.execute(Command::ForgetRequest { id: failed_id })
+            .await
+            .unwrap();
+        assert!(
+            host.execute(Command::Retry { id: failed_id })
+                .await
+                .unwrap_err()
+                .contains("no managed request")
+        );
+        let mut cancelled = submission;
+        cancelled.handoff_id = Some("device_A-cancelled".into());
+        cancelled.request.output = Some(dir.path().join("out/cancelled.bin"));
+        let Response::Accepted { id: cancelled_id } = host
+            .execute(Command::Submit {
+                submission: cancelled,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("no cancellation acceptance")
+        };
+        host.execute(Command::Cancel { id: cancelled_id })
+            .await
+            .unwrap();
+        host.execute(Command::ForgetRequest { id: cancelled_id })
+            .await
+            .unwrap();
+        assert!(
+            Db::open_path(&db_path)
+                .unwrap()
+                .load_daemon_request(cancelled_id)
+                .unwrap()
+                .is_none()
+        );
+        let Response::Jobs { jobs, .. } = host
+            .execute(Command::List {
+                limit: 20,
+                offset: 0,
+                query: "".into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("no history")
+        };
+        let history = serde_json::to_string(&jobs).unwrap();
+        for secret in secrets {
+            assert!(!history.contains(secret));
+        }
+        host.stop().await;
+    }
 }

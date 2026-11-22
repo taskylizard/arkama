@@ -122,6 +122,7 @@ impl DownloadSession {
         handle: Handle,
         request: DownloadRequest,
     ) -> Result<DownloadHandle> {
+        request.context.validate()?;
         request.recovery.validate()?;
         let url = url::Url::parse(&request.url).map_err(|_| Error::InvalidUrl {
             message: "invalid URL".into(),
@@ -180,6 +181,7 @@ impl DownloadSession {
 /// # Ok(()) }
 /// ```
 pub async fn download(request: DownloadRequest) -> Result<DownloadSummary> {
+    request.context.validate()?;
     request.recovery.validate()?;
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
     download_inner(

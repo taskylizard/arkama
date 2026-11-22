@@ -95,7 +95,8 @@ The server, not an attached client, evaluates persisted eligibility.
 `batch` takes 1–32 `submissions` under the ordinary 64 KiB HTTP limit. It returns ordered per-item
 `accepted` job IDs or `rejected` structured errors. Each accepted item is already durable; a later
 item's failure does not roll it back. Invalid collection/field sizes reject admission of the entire
-batch. Transport interruption remains ambiguous; duplicate-safe handoff IDs follow in milestone 7.
+batch. Give every item its own stable `handoff_id` to reconcile ambiguous transport acceptance;
+resubmitting identical items returns their original IDs, while changed input conflicts.
 Use `list` with bounded limit/offset/query for history/search and `show` for authoritative snapshots.
 The CLI `manage` command prints JSON, including batch failures, without a GUI or progress stream.
 

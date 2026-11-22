@@ -2,15 +2,23 @@
 name = "arkama_data"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.85"
 
 [dependencies]
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 arkama_core = { path = "../arkama_core" }
+base64 = "0.22"
 directories = "5"
 eyre.workspace = true
+getrandom = "0.3"
+hmac = "0.12"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+tempfile = "3"
 tracing.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

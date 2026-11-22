@@ -256,6 +256,23 @@ impl Actor {
                 queued: self.db.count_queued_daemon_downloads()?,
                 revision: self.revision,
             })),
+            Command::ForgetRequest { id } => {
+                let job = self.job(id)?;
+                if self.active.contains_key(&id)
+                    || !matches!(
+                        job.record.status.as_str(),
+                        "finished" | "failed" | "cancelled"
+                    )
+                {
+                    return Err(Error::new(
+                        "conflict",
+                        "only terminal jobs can forget replay context",
+                    ));
+                }
+                self.db.forget_request(id)?;
+                self.revision += 1;
+                Ok(Response::Ok)
+            }
             Command::Enqueue { request } => self.submit(request.into()),
             Command::Submit { submission } => self.submit(submission),
             Command::Batch { submissions } => {
@@ -545,11 +562,12 @@ impl Actor {
             None => {
                 let url = url::Url::parse(&request.url)
                     .map_err(|_| Error::new("invalid", "invalid download URL"))?;
-                let name = url
-                    .path_segments()
-                    .and_then(|mut segments| segments.next_back())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("download");
+                let name = request.context.filename.as_deref().unwrap_or_else(|| {
+                    url.path_segments()
+                        .and_then(|mut segments| segments.next_back())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("download")
+                });
                 if name == "." || name == ".." || name.contains(['/', '\\', ':']) {
                     return Err(Error::new("invalid", "filename is not a plain file name"));
                 }
@@ -616,8 +634,34 @@ impl Actor {
     }
 
     fn submit(&mut self, submission: Submission) -> Result<Response> {
+        validate_request(&submission.request)?;
+        if submission.handoff_id.as_ref().is_some_and(|id| {
+            id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "handoff IDs use 1–128 ASCII letters, digits, _ or -",
+            ));
+        }
+        let original = serde_json::to_string(&submission).expect("submission JSON");
+        if let Some(handoff) = &submission.handoff_id {
+            if let Some((id, matches)) = self.db.find_handoff(handoff, &original)? {
+                return if matches {
+                    Ok(Response::Accepted { id })
+                } else {
+                    Err(Error::new(
+                        "conflict",
+                        "handoff ID was accepted with different input",
+                    ))
+                };
+            }
+        }
         let Submission {
             mut request,
+            handoff_id,
             queue,
             priority,
             category,
@@ -679,7 +723,12 @@ impl Actor {
             }
             Err(error) => return Err(error),
         }
-        let id = self.db.insert_queued_download(&request, &queue, priority)?;
+        let id = self.db.insert_handoff_download(
+            &request,
+            &queue,
+            priority,
+            handoff_id.as_deref().map(|id| (id, original.as_str())),
+        )?;
         self.revision += 1;
         Ok(Response::Accepted { id })
     }
@@ -930,6 +979,12 @@ pub fn validate_setting(key: &str, value: &str) -> Result<()> {
 }
 
 fn validate_request(request: &DownloadRequest) -> Result<()> {
+    request.context.validate().map_err(|_| {
+        Error::new(
+            "invalid",
+            "invalid or unsupported request context; only GET handoffs are supported",
+        )
+    })?;
     let url =
         url::Url::parse(&request.url).map_err(|_| Error::new("invalid", "invalid download URL"))?;
     if request.url.len() > 8192

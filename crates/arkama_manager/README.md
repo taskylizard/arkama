@@ -65,6 +65,17 @@ operations via the daemon, or `manage --no-server` owns a local manager for one 
 it down before exit. A local enqueue therefore persists a queued/resumable job; it does not detach
 a background download. `daemon run --no-server` owns the manager until host shutdown, with no listener.
 
+`Submit { submission }` accepts GET request context and an optional stable `handoff_id`. Repeating
+identical input returns the original durable job, even after restart, completion or `forget_request`;
+changed input conflicts. IDs are 1–128 ASCII letters/digits/`_`/`-` and retain with history.
+Successful completion drops replay context; failed/cancelled jobs retain it for explicit retry.
+`ForgetRequest { id }` drops terminal replay context without deleting history, identity or files.
+Queued/paused/active jobs refuse it. Output reservations are independent of retained credentials.
+Protected storage requires the matching `<database>.with_extension("credentials")/request.key`.
+See [client inputs](../../docs/clients.md) for migration, threat-model and transport boundaries.
+The [embedded example](examples/handoff.rs) consumes a stdin submission and keeps the host runtime
+alive through explicit shutdown; synchronous SQLite/transfer work stays outside a future GUI frame.
+
 Settings `max_concurrent` and `connections` accept 1–64; `download_dir` is a nonempty path;
 `speed_limit` is an optional bytefmt per-request default. `max_concurrent` changes future admission
 live without preempting workers. The legacy standalone CLI settings remain an offline store editor;

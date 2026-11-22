@@ -1,7 +1,5 @@
 //! The existing local daemon's line-delimited JSON request and response types.
 
-use std::path::PathBuf;
-
 use arkama_core::DownloadRequest;
 use arkama_data::DownloadRecord;
 use serde::{Deserialize, Serialize};
@@ -11,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub(super) enum DaemonRequest {
     Ping,
     Shutdown,
-    Enqueue(QueuedDownloadRequest),
+    Enqueue(DownloadRequest),
     List { limit: usize, query: Option<String> },
     Show { id: i64 },
     Pause { id: i64 },
@@ -31,70 +29,6 @@ pub(super) enum DaemonResponse {
     ShuttingDown,
     Managed(arkama_manager::Response),
     Error { message: String },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct QueuedDownloadRequest {
-    url: String,
-    output: Option<PathBuf>,
-    output_dir: Option<PathBuf>,
-    connections: usize,
-    user_agent: Option<String>,
-    limit: Option<u64>,
-    experimental_entropy: bool,
-    #[serde(default)]
-    recovery: arkama_core::RecoveryPolicy,
-}
-
-impl From<DownloadRequest> for QueuedDownloadRequest {
-    fn from(request: DownloadRequest) -> Self {
-        let DownloadRequest {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-            recovery,
-        } = request;
-        Self {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-            recovery,
-        }
-    }
-}
-
-impl From<QueuedDownloadRequest> for DownloadRequest {
-    fn from(request: QueuedDownloadRequest) -> Self {
-        let QueuedDownloadRequest {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-            recovery,
-        } = request;
-        Self {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-            recovery,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

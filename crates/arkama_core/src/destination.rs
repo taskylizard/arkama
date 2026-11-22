@@ -51,13 +51,13 @@ impl DestinationPolicy {
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
             return Err(crate::Error::download_failed("unsupported destination"));
         }
-        if !self.restricted {
-            return Ok(());
-        }
         if !url.username().is_empty() || url.password().is_some() {
             return Err(crate::Error::download_failed(
                 "URL credentials are not allowed",
             ));
+        }
+        if !self.restricted {
+            return Ok(());
         }
         let exception = self
             .private_origins

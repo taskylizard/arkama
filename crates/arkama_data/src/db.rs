@@ -14,6 +14,7 @@ mod schema;
 
 pub struct Db {
     conn: Connection,
+    secrets: crate::secrets::Secrets,
 }
 
 impl Db {
@@ -30,8 +31,29 @@ impl Db {
         }
         let conn = Connection::open(path).context("failed to open sqlite db")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let db = Self { conn };
+        conn.execute_batch("PRAGMA secure_delete = ON;")?;
+        let has_requests: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('downloads') WHERE name = 'daemon_request')", [], |row| row.get(0),
+        )?;
+        let has_handoffs: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('downloads') WHERE name = 'handoff_key')", [], |row| row.get(0))?;
+        let encrypted_exists = has_requests && conn.query_row(
+            if has_handoffs { "SELECT EXISTS(SELECT 1 FROM downloads WHERE daemon_request LIKE 'arkama:v1:%' OR handoff_key IS NOT NULL)" }
+            else { "SELECT EXISTS(SELECT 1 FROM downloads WHERE daemon_request LIKE 'arkama:v1:%')" }, [], |row| row.get(0),
+        )?;
+        let secrets = crate::secrets::Secrets::open(path, encrypted_exists)?;
+        let db = Self { conn, secrets };
         db.init()?;
+        let check = db.secrets.fingerprint("storage-key", "arkama:v1");
+        match db.get_setting("secret_key_check")? {
+            Some(stored) if stored != check => {
+                return Err(eyre::eyre!(
+                    "request storage key does not match this database"
+                ));
+            }
+            Some(_) => {}
+            None => db.set_setting("secret_key_check", &check)?,
+        }
+        db.protect_legacy_requests()?;
         Ok(db)
     }
 
@@ -73,7 +95,7 @@ impl Db {
                 queue_name, priority, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', 0, ?6, ?6)",
             params![
-                url,
+                arkama_core::redact_url(url),
                 output_path.display().to_string(),
                 status,
                 Option::<i64>::None,
@@ -95,11 +117,24 @@ impl Db {
         queue: &str,
         priority: i64,
     ) -> Result<i64> {
+        self.insert_handoff_download(request, queue, priority, None)
+    }
+
+    /// Handoff ID and original-submission fingerprint commit with the job, never afterward.
+    pub fn insert_handoff_download(
+        &self,
+        request: &DownloadRequest,
+        queue: &str,
+        priority: i64,
+        handoff: Option<(&str, &str)>,
+    ) -> Result<i64> {
         let now = now_ts();
         let output_path = queued_output_path(request);
-        let url = request.url.clone();
-        let request =
-            serde_json::to_string(request).context("failed to serialize daemon request")?;
+        let url = arkama_core::redact_url(&request.url);
+        let request = self.encode_request(request)?;
+        let key = handoff.map(|(id, _)| self.secrets.fingerprint("handoff-id", id));
+        let fingerprint =
+            handoff.map(|(_, original)| self.secrets.fingerprint("handoff-request", original));
         self.conn.execute(
             "INSERT INTO downloads (
                 url,
@@ -114,8 +149,8 @@ impl Db {
                 updated_at,
                 daemon_request,
                 state_since_ms,
-                output_key
-             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?9, ?10, ?5, ?5, ?6, ?7, ?8)",
+                output_key, handoff_key, handoff_hash
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?9, ?10, ?5, ?5, ?6, ?7, ?8, ?11, ?12)",
             params![
                 url,
                 output_path.display().to_string(),
@@ -127,6 +162,8 @@ impl Db {
                 output_key(output_path),
                 queue,
                 priority,
+                key,
+                fingerprint,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -134,8 +171,7 @@ impl Db {
 
     pub fn update_daemon_request(&self, id: i64, request: &DownloadRequest) -> Result<()> {
         let output = queued_output_path(request);
-        let request =
-            serde_json::to_string(request).context("failed to serialize daemon request")?;
+        let request = self.encode_request(request)?;
         self.conn.execute(
             "UPDATE downloads SET daemon_request = ?1, updated_at = ?2, output_path = ?4, output_key = ?5 WHERE id = ?3",
             params![request, now_ts(), id, output.to_string_lossy(), output_key(output)],
@@ -181,7 +217,14 @@ impl Db {
             "UPDATE downloads
              SET etag = ?1, last_modified = ?2, mime_type = ?3, final_url = ?4, updated_at = ?5
              WHERE id = ?6",
-            params![etag, last_modified, mime_type, final_url, now_ts(), id],
+            params![
+                etag,
+                last_modified,
+                mime_type,
+                arkama_core::redact_url(final_url),
+                now_ts(),
+                id
+            ],
         )?;
         Ok(())
     }
@@ -204,7 +247,7 @@ impl Db {
         let finished_at = now_ts();
         self.conn.execute(
             "UPDATE downloads
-             SET status = ?1, error_message = NULL, total_bytes = ?2, downloaded_bytes = ?3,
+             SET status = ?1, error_message = NULL, daemon_request = NULL, total_bytes = ?2, downloaded_bytes = ?3,
                  finished_at = ?4, updated_at = ?4
              WHERE id = ?5",
             params![
@@ -371,9 +414,7 @@ impl Db {
                 continue;
             }
 
-            let request = serde_json::from_str(&request).with_context(|| {
-                format!("failed to deserialize daemon request for download {id}")
-            })?;
+            let request = self.decode_request(&request)?;
             return Ok(Some((id, request)));
         }
     }
@@ -496,13 +537,90 @@ impl Db {
             .optional()?
             .flatten();
         serialized
-            .map(|request| serde_json::from_str(&request).map_err(Into::into))
+            .map(|request| self.decode_request(&request))
             .transpose()
+    }
+
+    /// Returns existing durable acceptance and whether the original submission is identical.
+    pub fn find_handoff(&self, id: &str, original: &str) -> Result<Option<(i64, bool)>> {
+        let key = self.secrets.fingerprint("handoff-id", id);
+        let fingerprint = self.secrets.fingerprint("handoff-request", original);
+        self.conn
+            .query_row(
+                "SELECT id, handoff_hash FROM downloads WHERE handoff_key = ?1",
+                [key],
+                |row| {
+                    let hash: String = row.get(1)?;
+                    Ok((row.get(0)?, hash == fingerprint))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Drops replay material only for terminal jobs. History/handoff identity/files remain.
+    pub fn forget_request(&self, id: i64) -> Result<()> {
+        self.conn.execute("UPDATE downloads SET daemon_request = NULL WHERE id = ?1 AND status IN ('finished', 'failed', 'cancelled')", [id])?;
+        Ok(())
+    }
+
+    fn encode_request(&self, request: &DownloadRequest) -> Result<String> {
+        let data = zeroize::Zeroizing::new(serde_json::to_string(request)?);
+        self.secrets.seal(&data)
+    }
+
+    fn decode_request(&self, data: &str) -> Result<DownloadRequest> {
+        serde_json::from_str(&self.secrets.unseal(data)?)
+            .map_err(|_| eyre::eyre!("invalid protected request"))
+    }
+
+    fn protect_legacy_requests(&self) -> Result<()> {
+        if self.get_setting("secret_storage")?.as_deref() == Some("1") {
+            return Ok(());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut migrated = false;
+        {
+            let mut stmt = transaction
+                .prepare("SELECT id, url, final_url, daemon_request, status FROM downloads")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let url: String = row.get(1)?;
+                let final_url: Option<String> = row.get(2)?;
+                let request: Option<String> = row.get(3)?;
+                let status: String = row.get(4)?;
+                migrated = true;
+                let request = if status == "finished" {
+                    None
+                } else {
+                    request
+                        .as_ref()
+                        .map(|data| {
+                            if data.starts_with(crate::secrets::PREFIX) {
+                                Ok(data.clone())
+                            } else {
+                                self.secrets.seal(data)
+                            }
+                        })
+                        .transpose()?
+                };
+                transaction.execute("UPDATE downloads SET url = ?1, final_url = ?2, daemon_request = ?3, etag = NULL,
+                error_message = CASE WHEN error_message IS NULL THEN NULL ELSE 'Previous failure; details cleared during secret migration' END WHERE id = ?4",
+                params![arkama_core::redact_url(&url), final_url.as_deref().map(arkama_core::redact_url), request, id])?;
+            }
+        }
+        transaction.execute("INSERT INTO settings(key, value) VALUES ('secret_storage', '1') ON CONFLICT(key) DO UPDATE SET value = '1'", [])?;
+        transaction.commit()?;
+        if migrated {
+            self.conn.execute_batch("VACUUM;")?;
+        }
+        Ok(())
     }
 
     pub fn output_owner(&self, output: &Path, except_id: i64) -> Result<Option<i64>> {
         self.conn.query_row(
-            "SELECT id FROM downloads WHERE daemon_request IS NOT NULL AND output_key = ?1 AND id != ?2 AND status != 'cancelled' LIMIT 1",
+            "SELECT id FROM downloads WHERE output_key = ?1 AND id != ?2 AND status != 'cancelled' LIMIT 1",
             params![output_key(output), except_id], |row| row.get(0),
         ).optional().map_err(Into::into)
     }
@@ -511,7 +629,7 @@ impl Db {
     pub fn refresh_output_keys(&self) -> Result<()> {
         let mut statement = self
             .conn
-            .prepare("SELECT id, output_path FROM downloads WHERE daemon_request IS NOT NULL")?;
+            .prepare("SELECT id, output_path FROM downloads WHERE daemon_request IS NOT NULL OR output_key IS NOT NULL")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
@@ -674,6 +792,7 @@ mod tests {
             limit: None,
             experimental_entropy: false,
             recovery: Default::default(),
+            context: Default::default(),
         }
     }
 
@@ -784,5 +903,84 @@ mod tests {
         assert_eq!(status_for(&db, running_id), "queued");
         assert_eq!(status_for(&db, starting_id), "queued");
         assert_eq!(status_for(&db, paused_id), "paused");
+    }
+
+    #[test]
+    fn protected_requests_migrate_reopen_and_fail_closed_without_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let request = DownloadRequest::new("https://example.com/file?token=query-secret").context(
+            arkama_core::RequestContext {
+                cookies: Some("session=cookie-secret".into()),
+                ..Default::default()
+            },
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE downloads(id INTEGER PRIMARY KEY, url TEXT NOT NULL, output_path TEXT NOT NULL,
+            status TEXT NOT NULL, total_bytes INTEGER, downloaded_bytes INTEGER NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, daemon_request TEXT);").unwrap();
+        conn.execute("INSERT INTO downloads(id,url,output_path,status,downloaded_bytes,started_at,daemon_request) VALUES (1,?1,'','paused',0,0,?2)", params![request.url, serde_json::to_string(&request).unwrap()]).unwrap();
+        drop(conn);
+        let db = Db::open_path(&path).unwrap();
+        assert_eq!(db.load_daemon_request(1).unwrap().unwrap().url, request.url);
+        assert_eq!(
+            db.load_daemon_request(1).unwrap().unwrap().context.cookies,
+            request.context.cookies
+        );
+        assert_eq!(
+            db.load_download(1).unwrap().unwrap().url,
+            "https://example.com/[redacted]"
+        );
+        drop(db);
+        let bytes = std::fs::read(&path).unwrap();
+        for secret in ["query-secret", "cookie-secret"] {
+            assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        }
+        let key_path = path.with_extension("credentials").join("request.key");
+        let key = std::fs::read(&key_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(&key_path).unwrap();
+        assert!(Db::open_path(&path).is_err());
+        assert!(!key_path.exists(), "missing key silently replaced");
+        std::fs::write(&key_path, [0u8; 32]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(Db::open_path(&path).is_err(), "wrong key silently accepted");
+        std::fs::write(&key_path, key).unwrap();
+        let db = Db::open_path(&path).unwrap();
+        assert_eq!(db.load_daemon_request(1).unwrap().unwrap().url, request.url);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let encoded: String = conn
+            .query_row(
+                "SELECT daemon_request FROM downloads WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE downloads SET daemon_request = ?1 WHERE id=1",
+            [format!("{encoded}broken")],
+        )
+        .unwrap();
+        let error = db.load_daemon_request(1).unwrap_err().to_string();
+        assert!(!error.contains("query-secret"));
+        assert!(!error.contains("cookie-secret"));
+        conn.execute(
+            "UPDATE downloads SET daemon_request = ?1 WHERE id=1",
+            [encoded],
+        )
+        .unwrap();
+        db.update_download_cancelled(1).unwrap();
+        db.forget_request(1).unwrap();
+        assert!(db.load_daemon_request(1).unwrap().is_none());
     }
 }

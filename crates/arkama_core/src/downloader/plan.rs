@@ -39,6 +39,7 @@ pub(crate) struct DownloadPlan {
 
 pub(crate) struct DownloadPlanConfig {
     pub(crate) url: Url,
+    pub(crate) identity: String,
     pub(crate) output: PathBuf,
     pub(crate) meta: HttpMeta,
     pub(crate) connections: usize,
@@ -56,6 +57,7 @@ impl DownloadPlan {
     pub(crate) fn new(config: DownloadPlanConfig) -> Result<Self> {
         let DownloadPlanConfig {
             url,
+            identity,
             output,
             meta,
             connections,
@@ -83,12 +85,12 @@ impl DownloadPlan {
         let mut resumed_bytes = 0;
         if let Some(saved) = resume {
             if ranged
-                && saved.version == 1
-                && saved.url == url.as_str()
+                && saved.version == 2
+                && saved.url == identity
                 && saved.output == output
                 && saved.total_size == meta.size
-                && saved.etag == meta.etag
-                && saved.final_url.as_deref() == Some(meta.final_url.as_str())
+                && saved.etag == meta.etag.as_deref().map(crate::context::digest)
+                && saved.final_url == Some(crate::context::digest(&meta.final_url))
                 && saved.experimental_entropy == experimental_entropy
                 && saved.segment_size == segment_size
                 && output.metadata().map(|m| m.len()).ok() == meta.size
@@ -104,14 +106,14 @@ impl DownloadPlan {
             prepare_output(&output, 0)?;
         }
         let state = DownloadState {
-            version: 1,
-            url: url.to_string(),
+            version: 2,
+            url: identity,
             output: output.clone(),
             total_size: meta.size,
-            etag: meta.etag.clone(),
+            etag: meta.etag.as_deref().map(crate::context::digest),
             last_modified: meta.last_modified.clone(),
             mime_type: meta.mime_type.clone(),
-            final_url: Some(meta.final_url.clone()),
+            final_url: Some(crate::context::digest(&meta.final_url)),
             segments,
             segment_size,
             experimental_entropy,

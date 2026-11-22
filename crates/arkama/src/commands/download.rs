@@ -38,7 +38,7 @@ async fn run_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
     let requests = resolve_requests(&db, args)?;
 
     for request in requests {
-        let url = request.url.clone();
+        let url = arkama_core::redact_url(&request.url);
         run_single(&db, request, output_mode, url).await?;
     }
 
@@ -55,7 +55,7 @@ async fn queue_args(args: DownloadArgs, output_mode: OutputMode) -> Result<()> {
     let requests = resolve_requests(&db, args)?;
 
     for request in requests {
-        let url = request.url.clone();
+        let url = arkama_core::redact_url(&request.url);
         let id = daemon::enqueue_download(request).await?;
         emit_queued(output_mode, id, &url)?;
     }
@@ -97,6 +97,7 @@ fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>>
             limit,
             experimental_entropy,
             recovery,
+            context: Default::default(),
         }]);
     };
 
@@ -120,6 +121,7 @@ fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>>
             limit,
             experimental_entropy,
             recovery: recovery.clone(),
+            context: Default::default(),
         });
     }
 

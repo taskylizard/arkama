@@ -3,6 +3,7 @@
 use arkama_manager::{Command, Manager};
 use clap::Args;
 use eyre::{Context, Result};
+use std::io::Read;
 
 #[derive(Args, Debug)]
 pub struct ManageArgs {
@@ -11,16 +12,27 @@ pub struct ManageArgs {
         help = "Own the local manager for this command, without a listener. Stops/checkpoints on exit."
     )]
     no_server: bool,
-    #[arg(help = "JSON manager command, e.g. '{\"op\":\"status\"}'.")]
+    #[arg(help = "JSON manager command or '-' for bounded stdin (use stdin for credentials).")]
     command: String,
 }
 
 pub async fn run(args: ManageArgs) -> Result<()> {
-    if args.command.len() > 65_536 {
+    let data = if args.command == "-" {
+        let mut data = String::new();
+        std::io::stdin()
+            .take(65_537)
+            .read_to_string(&mut data)
+            .context("cannot read manager command")?;
+        data
+    } else {
+        args.command
+    };
+    if data.len() > 65_536 {
         return Err(eyre::eyre!("manager command exceeds size limit"));
     }
-    let command: Command =
-        serde_json::from_str(&args.command).context("invalid manager command")?;
+    let command: Command = serde_json::from_str(&data).map_err(|_| {
+        eyre::eyre!("invalid manager command; only supported GET context can be submitted")
+    })?;
     let response = if args.no_server {
         let manager =
             Manager::open(arkama_data::db_path()?, tokio::runtime::Handle::current()).await?;

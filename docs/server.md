@@ -85,7 +85,9 @@ arkama daemon run --download-root ~/Downloads --allow-private-source http://192.
 
 Exceptions authorize an exact scheme/hostname/port, not arbitrary redirects or other ports.
 They are host configuration, never request fields. URL user/password credentials and unknown
-handoff fields are refused. Credential-bearing browser context follows in the next input milestone.
+handoff fields are refused. Supported GET context uses explicit headers/cookies/referrer instead;
+all context headers are removed on an origin change, including a redirect back. HTTPS downgrades
+are refused. See [protected client inputs](clients.md) for bounds, retention and examples.
 
 Outputs must stay inside authorized roots. Directory traversal and paths through symlinks are
 refused. Managed names reject Windows devices, alternate streams, control characters, trailing
@@ -112,7 +114,8 @@ Unknown routes, methods and command fields are refused. Unsupported API versions
 
 The old raw line-delimited TCP endpoint is removed; clients must upgrade with the server.
 Use `/v1/commands` for new clients. Current capabilities include jobs, controls, settings, paginated
-history/search, diagnostics, updates, queues, folder rules, batches, shared limits and schedules.
+history/search, diagnostics, updates, queues, folder rules, batches, shared limits, schedules,
+`request_context`, `handoff_ids` and `forget_request`. Video/extraction is not an available capability.
 See [download management](management.md) for these commands and persisted admission semantics.
 
 Commands include `status`, `enqueue`, `list`, `show`, `pause`, `resume`, `cancel`, `retry`,
@@ -123,8 +126,10 @@ Commands include `status`, `enqueue`, `list`, `show`, `pause`, `resume`, `cancel
 ```
 
 Acceptance returns `{"type":"accepted","id":1}` only after persistence. A transport timeout is
-ambiguous: fetch state before repeating a mutating command. Duplicate-safe handoff IDs are the
-next milestone. `pause`/`cancel` replies describe joined, persisted state, not merely a request.
+ambiguous: repeat `submit` with the same `handoff_id` and identical original input to obtain the
+same accepted job. Changed input conflicts. Plain `enqueue` and other mutations have no such
+deduplication; fetch state before retrying them. `pause`/`cancel` replies describe joined, persisted
+state, not merely a request. Download credentials are separate from the control API key.
 
 List requires `limit` (1–100), `offset` (0–1,000,000) and `query` (up to 1,024 bytes). It returns
 `jobs`, `offset`, `has_more` and `revision`. Show returns an authoritative job `record` and optional

@@ -137,6 +137,9 @@ pub enum Collision {
 #[serde(deny_unknown_fields)]
 pub struct Submission {
     pub request: arkama_core::DownloadRequest,
+    /// Opaque client-generated ID. Reuse with identical input returns the original durable job.
+    #[serde(default)]
+    pub handoff_id: Option<String>,
     #[serde(default = "default_queue")]
     pub queue: String,
     #[serde(default)]
@@ -155,6 +158,7 @@ impl From<arkama_core::DownloadRequest> for Submission {
     fn from(request: arkama_core::DownloadRequest) -> Self {
         Self {
             request,
+            handoff_id: None,
             queue: default_queue(),
             priority: 0,
             category: None,
@@ -166,6 +170,7 @@ impl From<arkama_core::DownloadRequest> for Submission {
 impl Submission {
     pub(crate) fn size_valid(&self) -> bool {
         self.queue.len() <= 64
+            && self.handoff_id.as_ref().is_none_or(|id| id.len() <= 128)
             && self.category.as_ref().is_none_or(|value| value.len() <= 64)
             && crate::model::request_size_valid(&self.request)
     }

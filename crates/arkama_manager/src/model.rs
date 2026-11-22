@@ -56,6 +56,9 @@ pub enum Command {
     Retry {
         id: i64,
     },
+    ForgetRequest {
+        id: i64,
+    },
     GetSetting {
         key: String,
     },
@@ -103,6 +106,33 @@ impl Command {
 
 pub(crate) fn request_size_valid(request: &DownloadRequest) -> bool {
     request.url.len() <= 8192
+        && request.context.headers.len() <= 16
+        && request
+            .context
+            .headers
+            .iter()
+            .all(|(k, v)| k.len() <= 128 && v.len() <= 8192)
+        && request
+            .context
+            .cookies
+            .as_ref()
+            .is_none_or(|v| v.len() <= 4096)
+        && request
+            .context
+            .referrer
+            .as_ref()
+            .is_none_or(|v| v.len() <= 8192)
+        && request
+            .context
+            .source
+            .as_ref()
+            .is_none_or(|v| v.len() <= 8192)
+        && request
+            .context
+            .filename
+            .as_ref()
+            .is_none_or(|v| v.len() <= 240)
+        && request.context.method.len() <= 16
         && request
             .output
             .as_ref()

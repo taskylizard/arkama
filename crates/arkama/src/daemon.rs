@@ -174,9 +174,7 @@ async fn adapt_request(manager: &Manager, request: DaemonRequest) -> DaemonRespo
     let managed = matches!(request, DaemonRequest::Manage { .. });
     let command = match request {
         DaemonRequest::Ping => Command::Status,
-        DaemonRequest::Enqueue(request) => Command::Enqueue {
-            request: request.into(),
-        },
+        DaemonRequest::Enqueue(request) => Command::Enqueue { request },
         DaemonRequest::List { limit, query } => Command::List {
             limit,
             offset: 0,

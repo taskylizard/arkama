@@ -30,7 +30,7 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 /// ```
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DownloadRequest {
     pub url: String,
     pub output: Option<PathBuf>,
@@ -41,6 +41,24 @@ pub struct DownloadRequest {
     pub experimental_entropy: bool,
     #[cfg_attr(feature = "serde", serde(default))]
     pub recovery: crate::RecoveryPolicy,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub context: crate::RequestContext,
+}
+
+impl std::fmt::Debug for DownloadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadRequest")
+            .field("url", &crate::redact_url(&self.url))
+            .field("output", &self.output)
+            .field("output_dir", &self.output_dir)
+            .field("connections", &self.connections)
+            .field("user_agent", &self.user_agent.is_some())
+            .field("limit", &self.limit)
+            .field("experimental_entropy", &self.experimental_entropy)
+            .field("recovery", &self.recovery)
+            .field("context", &self.context)
+            .finish()
+    }
 }
 
 impl DownloadRequest {
@@ -68,6 +86,7 @@ impl DownloadRequest {
             limit: None,
             experimental_entropy: false,
             recovery: crate::RecoveryPolicy::default(),
+            context: crate::RequestContext::default(),
         }
     }
 
@@ -121,6 +140,12 @@ impl DownloadRequest {
     /// Sets validated network deadlines and recovery bounds.
     pub fn recovery(mut self, recovery: crate::RecoveryPolicy) -> Self {
         self.recovery = recovery;
+        self
+    }
+
+    /// Sets validated GET-only browser context. Serialized requests contain credentials.
+    pub fn context(mut self, context: crate::RequestContext) -> Self {
+        self.context = context;
         self
     }
 
@@ -215,6 +240,12 @@ impl DownloadRequestBuilder {
     /// Sets network deadlines and recovery bounds.
     pub fn recovery(mut self, recovery: crate::RecoveryPolicy) -> Self {
         self.request = self.request.recovery(recovery);
+        self
+    }
+
+    /// Sets GET-only browser context.
+    pub fn context(mut self, context: crate::RequestContext) -> Self {
+        self.request = self.request.context(context);
         self
     }
 

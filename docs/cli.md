@@ -137,6 +137,11 @@ local host running until Ctrl+C. See the [lifecycle contract](../crates/arkama_m
 Managed jobs reserve output paths at admission and use URL basename inference; direct core downloads
 still prefer HTTP filenames. Search pagination is bounded through `manage`, including filtered pages.
 
+For credential-bearing JSON, use `arkama-cli manage -` with stdin instead of shell arguments/history.
+It reads at most 64 KiB. Unsupported method/body context fails explicitly; malformed command errors
+do not echo input. Intended `context.filename` overrides inferred names, unless output is explicit.
+See [client examples and credential retention](clients.md).
+
 `ARKAMA_DATA_DIR` overrides the application data directory containing `arkama.sqlite`, `daemon.addr`,
 and `daemon.log`. `ARKAMA_DAEMON_ADDR` overrides the daemon bind/client address. Local CLI discovery
 requires loopback. Authenticated remote access requires an owner-configured local TLS proxy; plain
