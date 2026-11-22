@@ -11,14 +11,15 @@ use std::time::{Duration, Instant};
 /// Inclusive durations. Worker timings sum across workers, not wall-clock phases.
 #[derive(Clone, Copy)]
 pub(crate) enum Phase {
-    Setup,
-    Transfer,
-    Retry,
-    Throttle,
-    DiskWrite,
-    Checkpoint,
-    Verification,
-    Publication,
+    Setup = 0,
+    Transfer = 1,
+    Retry = 2,
+    Throttle = 3,
+    DiskWrite = 4,
+    #[cfg(feature = "serde")]
+    Checkpoint = 5,
+    Verification = 6,
+    Publication = 7,
 }
 
 const PHASES: [&str; 8] = [
