@@ -7,8 +7,8 @@ A download manager written in Rust, with a reusable HTTP engine, a CLI, and a lo
 [CLI guide](docs/cli.md) · [Rust API](crates/arkama_core/README.md) · [Server API](docs/server.md) · [Client examples](docs/clients.md) · [Development](docs/development.md)
 
 > [!WARNING]
-> Arkama is in early development. The reliable core milestone has landed, but the full core/server
-> foundation is not complete. Server API keys are enabled by default; remote authenticated access
+> Arkama is in early development. The ordinary-file core/server foundation is implemented, not a
+> published production release. Server API keys are enabled by default; remote authenticated access
 > requires an owner-configured TLS proxy. A release license has not been added yet.
 
 ## Getting started
@@ -81,7 +81,7 @@ use current stable Rust for the whole workspace.
 ```sh
 cargo build --workspace --locked
 cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -89,15 +89,12 @@ CI runs workspace checks, tests, Clippy, formatting, and release builds on Linux
 The [development guide](docs/development.md) explains crate boundaries, source organization,
 documentation, and feature/MSRV checks.
 
-## Next milestones
+## Foundation status
 
 The reliability/safe-core API, bounded observations, configurable recovery, shared-manager,
 secure-server, download-management and protected-client-input milestones are implemented.
-See the [manager contract](crates/arkama_manager/README.md).
+Combined validation and its limits are documented in the [foundation validation guide](docs/validation.md).
+See the [manager contract](crates/arkama_manager/README.md) for host ownership and shutdown.
 Optional diagnostics use a dedicated OS thread; slow observers cannot back up the transfer path.
-
-The remaining foundation work is:
-
-8. Combined cross-platform, fault, security, and performance validation for a foundation release.
 
 Browser extensions, desktop/Android clients, video support, and measured acceleration remain later work.

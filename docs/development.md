@@ -5,25 +5,30 @@ separate; new modules should represent responsibilities rather than mirror a lar
 
 ## Build and check
 
-Use current stable Rust for the workspace. `arkama_core` separately declares Rust 1.85 as its minimum.
+Use current stable Rust for the CLI workspace. The core, data and manager libraries declare Rust 1.85
+as their minimum, separately from any later GUI toolchain.
 
 ```sh
 cargo build --workspace --locked
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The CI matrix runs these checks and release-mode CLI builds on Linux, macOS, and Windows. Validate
-core changes against the supported feature combinations and minimum Rust version as well:
+The CI matrix runs these checks and release-mode CLI builds on Linux, macOS, and Windows. Separate
+Linux jobs run the library API/examples and four core feature combinations on Rust 1.85:
 
 ```sh
 cargo +1.85.0 test -p arkama_core --locked
+cargo +1.85.0 test -p arkama_core -p arkama_data -p arkama_manager --all-targets --locked
 cargo test -p arkama_core --no-default-features --locked
+cargo test -p arkama_core --no-default-features --features serde --locked
+cargo test -p arkama_core --no-default-features --features native-tls,serde --locked
+cargo test -p arkama_core --no-default-features --features rustls-tls --locked
 cargo check -p arkama_core --all-features --all-targets --locked
 cargo test -p arkama_core --doc --locked
-cargo doc --workspace --no-deps --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 ```
 
 Install the 1.85 toolchain separately if it is not present. Core examples live in
@@ -35,9 +40,9 @@ so choose the URL and output path intentionally when running them.
 | Crate | Owns | Does not own |
 | --- | --- | --- |
 | [`arkama_core`](../crates/arkama_core) | HTTP identity/ranges, transfer workers, partial files, checkpoints, controls, completion. | SQLite, a listener, runtime creation, Ctrl+C registration, or tracing setup. |
-| [`arkama_data`](../crates/arkama_data) | Synchronous SQLite settings/history/queued requests and application paths. | Transfer scheduling, checkpoint validity, or transport. |
+| [`arkama_data`](../crates/arkama_data) | Synchronous SQLite settings/history, protected replay requests, key storage and application paths. | Transfer scheduling, checkpoint validity, or transport. |
 | [`arkama_manager`](../crates/arkama_manager) | Dedicated-thread persistence, scheduling, admission, output reservations, joined controls, snapshots. | Listener, runtime creation, signals, or tracing setup. |
-| [`arkama`](../crates/arkama) | Command parsing, command handlers, terminal/JSON output, signals, and the existing local daemon. | A second download engine or the planned secure server contract. |
+| [`arkama`](../crates/arkama) | Command parsing, terminal/JSON output, signals, authenticated HTTP server and client transport. | A second download engine or manager. |
 
 Dependencies point from `arkama` to the manager/data/core, from the manager to data/core, and from
 data to core request/result types.
@@ -51,14 +56,18 @@ the crate root; safe dependency APIs may have unsafe internals.
 - **Core:** `request.rs` owns configuration/builders; `task.rs` owns events, completion, and controls;
   `downloader.rs` owns entry points and its private orchestration modules. `http.rs` handles representation
   and response validation; `segment.rs` owns byte-range geometry; `error.rs` owns public errors.
+  `context.rs` validates GET replay/redirect context, `recovery.rs` owns retry policy, `limits.rs`
+  owns shared admission, and `observation.rs` owns counters and the optional collector thread.
 - **CLI:** `cli.rs` parses and dispatches each binary's command tree; `args.rs` supplies shared download
   arguments. `commands/` contains the command handlers, with terminal rendering under `commands/download/`.
 - **Manager:** `model.rs` owns shared commands and snapshots; `actor.rs` owns serialized scheduling,
   persistence and joined state changes. The crate root owns bounded handles and thread lifecycle.
 - **Daemon:** `daemon.rs` owns startup, signals and bounded connections. `daemon/client.rs` sends
-  requests; `daemon/protocol.rs` owns the current wire representation. Scheduling belongs to the manager.
+  requests; `daemon/server.rs` owns HTTP policy/routing, `daemon/auth.rs` owns control API keys and
+  `daemon/protocol.rs` owns legacy CLI shapes. Scheduling belongs to the manager.
 - **Data:** `db.rs` owns connection/query access; `db/schema.rs` owns initialization and compatibility
   migrations. `model.rs` defines stored records and `paths.rs` resolves application locations.
+  `secrets.rs` protects replay JSON separately from visible history and control credentials.
 
 Use explicit modules, descriptive names, and private implementation details. Prefer the existing safe
 APIs and ordinary structs/enums over new wrappers, traits, crates, or generic layers without a consumer
@@ -68,7 +77,8 @@ Local formatting is controlled by rustfmt; the reference projects do not share o
 ## Tests and documentation
 
 Public HTTP behavior is covered in `arkama_core/tests/download_e2e.rs` using the server in `tests/support/`.
-CLI integration tests exercise binary downloads; data tests cover queue claims and restart recovery.
+CLI integration tests exercise binary downloads, real daemon/manager controls, boundaries and reconnects;
+data tests cover queue claims, restart recovery and protected-storage migration/key failures.
 Extend these fixtures when changing a contract. A structure-only refactor should pass the existing
 tests unchanged, not add assertions tied to module names or private call order.
 
@@ -77,6 +87,7 @@ command details; the core README owns the runtime/resume/control contract. Core 
 README directly so its example is checked by doctests instead of maintaining a second introduction.
 Public item docs explain individual types/functions; module docs explain ownership and important invariants.
 Document limitations and actual defaults alongside features. Do not present planned behavior as shipped.
+The [validation guide](validation.md) maps the foundation gates to these tests and controlled fault checks.
 
 ## Reference projects
 
