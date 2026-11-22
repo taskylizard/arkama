@@ -17,7 +17,7 @@ use support::{FlakyServer, FlakyServerConfig};
 
 enum Host {
     Local(Manager),
-    Server { child: Child, addr: String },
+    Server { child: Box<Child>, addr: String },
 }
 
 impl Host {
@@ -51,7 +51,10 @@ impl Host {
         })
         .await
         .unwrap();
-        Self::Server { child, addr }
+        Self::Server {
+            child: Box::new(child),
+            addr,
+        }
     }
 
     async fn execute(&self, command: Command) -> Result<Response, String> {
