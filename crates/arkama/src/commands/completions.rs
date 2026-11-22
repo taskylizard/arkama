@@ -1,3 +1,5 @@
+//! Shell completion generation for either binary's command tree.
+
 use std::io;
 
 use clap::{Args, CommandFactory, ValueEnum};

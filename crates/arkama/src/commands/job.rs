@@ -1,9 +1,11 @@
+//! Daemon job commands and detail presentation.
+
 use arkama_data::DownloadRecord;
 use clap::Args;
 use eyre::Result;
 
+use super::history;
 use crate::daemon;
-use crate::history;
 use crate::util::history_progress_text;
 
 #[derive(Args, Debug)]

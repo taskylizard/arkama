@@ -1,3 +1,5 @@
+//! History queries and the shared job-table presentation.
+
 use arkama_data::{Db, DownloadRecord};
 use clap::Args;
 use comfy_table::{

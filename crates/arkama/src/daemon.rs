@@ -1,3 +1,8 @@
+//! Local daemon startup, listener, and the existing job loop.
+//!
+//! Wire types and client requests live in child modules. This remains the local daemon,
+//! not the shared manager or authenticated server planned for later milestones.
+
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -7,10 +12,9 @@ use std::time::{Duration, Instant};
 use arkama_core::{
     DownloadControl, DownloadEvent, DownloadRequest, DownloadSummary, start_download_with_handle,
 };
-use arkama_data::{Db, DownloadRecord, daemon_addr_path, daemon_log_path};
+use arkama_data::{Db, daemon_addr_path, daemon_log_path};
 use clap::Subcommand;
 use eyre::{Context, Result};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
@@ -19,6 +23,15 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::util::should_persist_progress;
+
+mod client;
+mod protocol;
+
+pub(crate) use client::{
+    cancel_job, enqueue_download, list_jobs, pause_job, resume_job, retry_job, show_job,
+};
+use client::{send_request, status};
+use protocol::{DaemonRequest, DaemonResponse, DaemonStatus};
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
@@ -33,94 +46,6 @@ pub enum DaemonCommand {
 
     #[command(about = "Ask the daemon to stop.")]
     Stop,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum DaemonRequest {
-    Ping,
-    Shutdown,
-    Enqueue(QueuedDownloadRequest),
-    List { limit: usize, query: Option<String> },
-    Show { id: i64 },
-    Pause { id: i64 },
-    Resume { id: i64 },
-    Cancel { id: i64 },
-    Retry { id: i64 },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum DaemonResponse {
-    Pong(DaemonStatus),
-    Enqueued { id: i64 },
-    Jobs(Vec<DownloadRecord>),
-    Job(DownloadRecord),
-    Ok { message: String },
-    ShuttingDown,
-    Error { message: String },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct QueuedDownloadRequest {
-    url: String,
-    output: Option<PathBuf>,
-    output_dir: Option<PathBuf>,
-    connections: usize,
-    user_agent: Option<String>,
-    limit: Option<u64>,
-    experimental_entropy: bool,
-}
-
-impl From<DownloadRequest> for QueuedDownloadRequest {
-    fn from(request: DownloadRequest) -> Self {
-        let DownloadRequest {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-        } = request;
-        Self {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-        }
-    }
-}
-
-impl From<QueuedDownloadRequest> for DownloadRequest {
-    fn from(request: QueuedDownloadRequest) -> Self {
-        let QueuedDownloadRequest {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-        } = request;
-        Self {
-            url,
-            output,
-            output_dir,
-            connections,
-            user_agent,
-            limit,
-            experimental_entropy,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DaemonStatus {
-    pub pid: u32,
-    pub active: usize,
-    pub queued: usize,
 }
 
 struct ActiveDownload {
@@ -474,56 +399,6 @@ pub async fn run(command: DaemonCommand) -> Result<()> {
     }
 }
 
-pub async fn enqueue_download(request: DownloadRequest) -> Result<i64> {
-    let response = send_request(DaemonRequest::Enqueue(request.into())).await?;
-    match response {
-        DaemonResponse::Enqueued { id } if id >= 0 => Ok(id),
-        DaemonResponse::Enqueued { .. } => Err(eyre::eyre!("daemon is stopping")),
-        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        _ => Err(eyre::eyre!("unexpected daemon response")),
-    }
-}
-
-pub async fn list_jobs(limit: usize, query: Option<String>) -> Result<Vec<DownloadRecord>> {
-    match send_request(DaemonRequest::List { limit, query }).await? {
-        DaemonResponse::Jobs(jobs) => Ok(jobs),
-        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        _ => Err(eyre::eyre!("unexpected daemon response")),
-    }
-}
-
-pub async fn show_job(id: i64) -> Result<DownloadRecord> {
-    match send_request(DaemonRequest::Show { id }).await? {
-        DaemonResponse::Job(job) => Ok(job),
-        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        _ => Err(eyre::eyre!("unexpected daemon response")),
-    }
-}
-
-pub async fn pause_job(id: i64) -> Result<String> {
-    job_command(DaemonRequest::Pause { id }).await
-}
-
-pub async fn resume_job(id: i64) -> Result<String> {
-    job_command(DaemonRequest::Resume { id }).await
-}
-
-pub async fn cancel_job(id: i64) -> Result<String> {
-    job_command(DaemonRequest::Cancel { id }).await
-}
-
-pub async fn retry_job(id: i64) -> Result<String> {
-    job_command(DaemonRequest::Retry { id }).await
-}
-
-async fn job_command(request: DaemonRequest) -> Result<String> {
-    match send_request(request).await? {
-        DaemonResponse::Ok { message } => Ok(message),
-        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        _ => Err(eyre::eyre!("unexpected daemon response")),
-    }
-}
-
 fn init_tracing() -> Result<()> {
     let path = daemon_log_path()?;
     if let Some(parent) = path.parent() {
@@ -657,16 +532,6 @@ async fn stop_command() -> Result<()> {
     }
 }
 
-async fn status() -> Result<DaemonStatus> {
-    let response = send_request(DaemonRequest::Ping).await?;
-    match response {
-        DaemonResponse::Pong(status) => Ok(status),
-        DaemonResponse::Error { message } => Err(eyre::eyre!(message)),
-        DaemonResponse::ShuttingDown => Err(eyre::eyre!("daemon is shutting down")),
-        _ => Err(eyre::eyre!("unexpected daemon response")),
-    }
-}
-
 async fn prepare_listener() -> Result<TcpListener> {
     if status().await.is_ok() {
         return Err(eyre::eyre!("daemon already running"));
@@ -714,30 +579,6 @@ async fn handle_connection(
         .await
         .context("failed to finish daemon response")?;
     Ok(())
-}
-
-async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
-    let daemon_addr = read_daemon_addr()?;
-    let stream = TcpStream::connect(daemon_addr)
-        .await
-        .with_context(|| format!("failed to connect to daemon at {daemon_addr}"))?;
-    let (read_half, mut write_half) = stream.into_split();
-    let request = serde_json::to_vec(&request).context("failed to serialize daemon request")?;
-    write_half
-        .write_all(&request)
-        .await
-        .context("failed to write daemon request")?;
-    write_half
-        .write_all(b"\n")
-        .await
-        .context("failed to finish daemon request")?;
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read daemon response")?;
-    serde_json::from_str(&line).context("invalid daemon response")
 }
 
 fn daemon_bind_addr() -> Result<SocketAddr> {

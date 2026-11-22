@@ -1,3 +1,5 @@
+//! Read and write persisted CLI settings.
+
 use arkama_data::{Db, default_download_dir};
 use clap::{Args, Subcommand};
 use eyre::Result;

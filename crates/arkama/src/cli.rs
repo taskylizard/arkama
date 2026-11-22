@@ -1,80 +1,178 @@
-use clap::Args;
-use std::path::PathBuf;
+//! Command parsing and dispatch for both Arkama binaries.
 
-fn parse_rate(src: &str) -> Result<u64, String> {
-    let Ok(bytes) = bytefmt::parse(src) else {
-        return Err("invalid byte size".to_string());
-    };
-    Ok(bytes)
+use clap::{Args, Parser, Subcommand};
+use eyre::Result;
+
+use crate::args::DownloadArgs;
+use crate::commands::{completions, config, download, history, job};
+use crate::daemon;
+
+#[derive(Parser)]
+#[command(
+    name = "arkama",
+    version,
+    about = "High-performance download manager",
+    arg_required_else_help = true
+)]
+struct CombinedArgs {
+    #[command(subcommand)]
+    command: CombinedCommand,
+
+    #[arg(long = "reset-db", help = "Reset the application database.")]
+    reset_db: bool,
+}
+
+#[derive(Subcommand)]
+enum CombinedCommand {
+    #[command(about = "Add a download job to the daemon.")]
+    Add(DownloadArgs),
+
+    #[command(about = "Download a file from a URL.")]
+    Download(DownloadArgs),
+
+    #[command(about = "List daemon jobs.")]
+    List(job::JobListArgs),
+
+    #[command(about = "Show a daemon job.")]
+    Show(job::JobIdArgs),
+
+    #[command(about = "Pause a daemon job.")]
+    Pause(job::JobIdArgs),
+
+    #[command(about = "Resume a daemon job.")]
+    Resume(job::JobIdArgs),
+
+    #[command(about = "Cancel a daemon job.")]
+    Cancel(job::JobIdArgs),
+
+    #[command(about = "Retry a failed or cancelled daemon job.")]
+    Retry(job::JobIdArgs),
+
+    #[command(about = "Run or manage the background daemon.")]
+    Daemon(DaemonCliArgs),
+
+    #[command(about = "Show download history.")]
+    History(history::HistoryArgs),
+
+    #[command(about = "View or modify configuration.")]
+    Config(config::ConfigArgs),
+
+    #[command(about = "Generate shell completions.")]
+    Completions(completions::CompletionsArgs),
+}
+
+#[derive(Parser)]
+#[command(
+    name = "arkama-cli",
+    version,
+    about = "High-performance download manager CLI",
+    arg_required_else_help = true
+)]
+struct CliArgs {
+    #[command(subcommand)]
+    command: CliCommand,
+
+    #[arg(long = "reset-db", help = "Reset the application database.")]
+    reset_db: bool,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    #[command(about = "Add a download job to the daemon.")]
+    Add(DownloadArgs),
+
+    #[command(about = "Download a file from a URL.")]
+    Download(DownloadArgs),
+
+    #[command(about = "List daemon jobs.")]
+    List(job::JobListArgs),
+
+    #[command(about = "Show a daemon job.")]
+    Show(job::JobIdArgs),
+
+    #[command(about = "Pause a daemon job.")]
+    Pause(job::JobIdArgs),
+
+    #[command(about = "Resume a daemon job.")]
+    Resume(job::JobIdArgs),
+
+    #[command(about = "Cancel a daemon job.")]
+    Cancel(job::JobIdArgs),
+
+    #[command(about = "Retry a failed or cancelled daemon job.")]
+    Retry(job::JobIdArgs),
+
+    #[command(about = "Run or manage the background daemon.")]
+    Daemon(DaemonCliArgs),
+
+    #[command(about = "Show download history.")]
+    History(history::HistoryArgs),
+
+    #[command(about = "View or modify configuration.")]
+    Config(config::ConfigArgs),
+
+    #[command(about = "Generate shell completions.")]
+    Completions(completions::CompletionsArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct DownloadArgs {
-    #[arg(
-        value_name = "URL",
-        required_unless_present = "links_file",
-        help = "Download URL."
-    )]
-    pub url: Option<String>,
+struct DaemonCliArgs {
+    #[command(subcommand)]
+    command: daemon::DaemonCommand,
+}
 
-    #[arg(
-        long = "links-file",
-        value_name = "PATH",
-        conflicts_with = "url",
-        help = "Text file with one download URL per line."
-    )]
-    pub links_file: Option<PathBuf>,
+pub async fn run_combined() -> Result<()> {
+    let args = CombinedArgs::parse();
 
-    #[arg(short = 'o', long = "output", help = "Output file path.")]
-    pub output: Option<PathBuf>,
+    if args.reset_db {
+        arkama_data::reset_db()?;
+    }
 
-    #[arg(
-        long = "connections",
-        help = "Concurrent connections for segmented downloads (defaults to config, otherwise 4)."
-    )]
-    pub connections: Option<usize>,
+    match args.command {
+        CombinedCommand::Add(mut download_args) => {
+            download_args.daemon = true;
+            download::run(download_args).await
+        }
+        CombinedCommand::Download(download_args) => download::run(download_args).await,
+        CombinedCommand::List(job_args) => job::list(job_args).await,
+        CombinedCommand::Show(job_args) => job::show(job_args).await,
+        CombinedCommand::Pause(job_args) => job::pause(job_args).await,
+        CombinedCommand::Resume(job_args) => job::resume(job_args).await,
+        CombinedCommand::Cancel(job_args) => job::cancel(job_args).await,
+        CombinedCommand::Retry(job_args) => job::retry(job_args).await,
+        CombinedCommand::Daemon(daemon_args) => daemon::run(daemon_args.command).await,
+        CombinedCommand::History(history_args) => history::run(history_args),
+        CombinedCommand::Config(config_args) => config::run(config_args),
+        CombinedCommand::Completions(completions_args) => {
+            completions::run::<CombinedArgs>(completions_args, "arkama")
+        }
+    }
+}
 
-    #[arg(long = "user-agent", help = "Override HTTP User-Agent.")]
-    pub user_agent: Option<String>,
+pub async fn run_cli() -> Result<()> {
+    let args = CliArgs::parse();
 
-    #[arg(
-        long = "limit",
-        value_name = "BYTES_PER_SEC",
-        value_parser = parse_rate,
-        help = "Global download speed limit (defaults to config if unset; ex: 2MB, 500KB)."
-    )]
-    pub limit: Option<u64>,
+    if args.reset_db {
+        arkama_data::reset_db()?;
+    }
 
-    #[arg(
-        long = "experimental-entropy",
-        help = "Experimental: rotate source ports and recycle slow segment connections."
-    )]
-    pub experimental_entropy: bool,
-
-    #[arg(
-        long = "daemon",
-        help = "Submit the download to the local arkama daemon instead of downloading in the current process."
-    )]
-    pub daemon: bool,
-
-    #[arg(
-        long = "silent",
-        conflicts_with = "json",
-        help = "Suppress progress and summary output."
-    )]
-    pub silent: bool,
-
-    #[arg(
-        long = "json",
-        conflicts_with = "silent",
-        help = "Emit JSON events to stdout for automation."
-    )]
-    pub json: bool,
-
-    #[arg(
-        short = 'y',
-        long = "yes",
-        help = "Assume yes to all prompts (non-interactive)."
-    )]
-    pub yes: bool,
+    match args.command {
+        CliCommand::Add(mut download_args) => {
+            download_args.daemon = true;
+            download::run(download_args).await
+        }
+        CliCommand::Download(download_args) => download::run(download_args).await,
+        CliCommand::List(job_args) => job::list(job_args).await,
+        CliCommand::Show(job_args) => job::show(job_args).await,
+        CliCommand::Pause(job_args) => job::pause(job_args).await,
+        CliCommand::Resume(job_args) => job::resume(job_args).await,
+        CliCommand::Cancel(job_args) => job::cancel(job_args).await,
+        CliCommand::Retry(job_args) => job::retry(job_args).await,
+        CliCommand::Daemon(daemon_args) => daemon::run(daemon_args.command).await,
+        CliCommand::History(history_args) => history::run(history_args),
+        CliCommand::Config(config_args) => config::run(config_args),
+        CliCommand::Completions(completions_args) => {
+            completions::run::<CliArgs>(completions_args, "arkama-cli")
+        }
+    }
 }

@@ -1,7 +1,7 @@
-use crate::api::{
-    DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary,
-};
+//! Public download entry points and private transfer orchestration.
+
 use crate::error::{Error, Result};
+use crate::{DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -181,7 +181,7 @@ mod tests {
     #[cfg(feature = "serde")]
     use super::state::{DownloadState, load_state, save_state};
     use super::worker::backoff_delay;
-    use crate::api::DownloadEvent;
+    use crate::DownloadEvent;
     use crate::http::HttpMeta;
     #[cfg(feature = "serde")]
     use crate::segment::Segment;

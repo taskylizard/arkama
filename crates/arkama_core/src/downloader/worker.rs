@@ -3,7 +3,7 @@ use super::output::ensure_parent_dir;
 use super::rate_limit::SpeedLimiter;
 use super::state::{DownloadState, update_state};
 use super::{EventSender, send_event};
-use crate::api::DownloadEvent;
+use crate::DownloadEvent;
 use crate::http::{self, ClientFactory, HttpMeta};
 use crate::segment::Segment;
 use eyre::{Context, Result};

@@ -1,3 +1,8 @@
+//! Synchronous SQLite persistence and application paths for Arkama.
+//!
+//! This crate stores settings, history, and serialized daemon requests. It does not schedule
+//! transfers or validate download checkpoints. Callers keep database work off transfer tasks.
+
 mod db;
 mod model;
 mod paths;

@@ -1,3 +1,5 @@
+//! Resolve CLI requests, run or enqueue them, and present their lifecycle.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,10 +11,11 @@ use serde_json::json;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::DownloadArgs;
+use crate::args::DownloadArgs;
 use crate::daemon;
-use crate::progress;
 use crate::util::{format_duration, format_speed};
+
+mod progress;
 
 pub async fn run(args: DownloadArgs) -> Result<()> {
     let output_mode = OutputMode::from_args(&args);

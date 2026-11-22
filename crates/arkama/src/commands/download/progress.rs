@@ -1,3 +1,5 @@
+//! Terminal progress rendering for direct downloads.
+
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};

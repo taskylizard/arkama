@@ -1,16 +1,17 @@
 # arkama_core
 
-Library API for arkama's HTTP/HTTPS downloader.
+Arkama's reusable HTTP/HTTPS download engine, implemented behind a safe Rust API.
 
-`arkama_core` is the reusable download engine used by the arkama CLI. It is intended for Rust
-applications that want file downloads with progress reporting, resume support, segmented transfers,
-pause/cancel controls, and optional speed limiting.
+Use it for direct or background downloads with validated resume, segmented transfers, progress,
+pause/cancel controls, and per-download speed limits. No CLI, database, or daemon is required.
+The host owns its Tokio runtime, process signals, tracing, and logging destinations.
 
 ## Status
 
-arkama is still early and the API is being prepared for crates.io publication. The public request
-fields remain available for compatibility, but new code should prefer `DownloadRequest::new`, the
-chainable setters, or `DownloadRequest::builder`.
+Arkama is in early development; the core/server foundation is not a finished release. The core
+supports Rust 1.85 and enforces `#![forbid(unsafe_code)]`. Public types are exported at the crate root.
+Request fields remain public for compatibility; new code can use `DownloadRequest::new`, its
+chainable setters, or `DownloadRequest::builder`. Use this workspace checkout for development.
 
 ## Quick start
 
@@ -54,6 +55,7 @@ The CLI translates Ctrl+C into a pause request.
 
 `DownloadEvent` currently reports:
 
+- `Metadata { etag, last_modified, mime_type, final_url }`
 - `Started { output, total_bytes, resumed_bytes }`
 - `Progress { downloaded_bytes, total_bytes }`
 - `Finished { summary }`
@@ -140,7 +142,8 @@ the enum directly.
 ## Speed limiting
 
 Use `DownloadRequest::speed_limit(bytes_per_second)` or the builder's `speed_limit` method to set an
-approximate global byte-per-second limit for a download.
+approximate byte-per-second cap shared by the workers of one download. This is not an
+application-wide cap across multiple jobs.
 
 ## Feature flags
 
@@ -163,4 +166,6 @@ disabled for HTTP-only embedded use.
 
 ## Examples
 
-See the crate examples for library-oriented usage inside `examples/`.
+The `examples/` directory contains a simple awaited download, progress reporting, speed limiting,
+and pause/resume. `cargo test -p arkama_core --doc --locked` checks the Rust examples in the API docs,
+including this README's quick start. The README is also the crate's rustdoc introduction.
