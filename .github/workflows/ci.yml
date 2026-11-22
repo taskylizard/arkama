@@ -39,7 +39,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -54,3 +54,37 @@ jobs:
           path: |
             target/release/arkama${{ matrix.exe_suffix }}
             target/release/arkama-cli${{ matrix.exe_suffix }}
+
+  core-compatibility:
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "serde", "native-tls,serde", "rustls-tls"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core-${{ matrix.features }}
+      - name: Test core features on Rust 1.85
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo test -p arkama_core --no-default-features --features '${{ matrix.features }}' --locked
+
+  api-compatibility:
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Test safe libraries and examples on Rust 1.85
+        run: cargo test -p arkama_core -p arkama_data -p arkama_manager --all-targets --locked
+      - name: Check API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc -p arkama_core -p arkama_data -p arkama_manager --no-deps --locked
