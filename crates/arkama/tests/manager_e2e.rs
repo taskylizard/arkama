@@ -488,7 +488,12 @@ async fn queues_rules_batches_and_limits_match_across_hosts_and_restart() {
     config.chunk_delay = Duration::from_millis(8);
     let source = FlakyServer::spawn(config.clone()).await;
     for server in [false, true] {
-        source.configure(config.clone());
+        // Keep both admitted jobs alive through every queue assertion, regardless of host speed.
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut held = config.clone();
+        held.body_gate = Some(gate.clone());
+        held.stall_after_bytes = 8192;
+        source.configure(held);
         let dir = tempfile::tempdir().unwrap();
         let mut host = Host::open(dir.path(), server, &source.url()).await;
         host.execute(Command::SetSetting {
@@ -633,6 +638,10 @@ async fn queues_rules_batches_and_limits_match_across_hosts_and_restart() {
         host.execute(Command::PutQueue { queue: low.clone() })
             .await
             .unwrap();
+        assert_eq!(host.job(b).await.record.status, "running");
+        assert_eq!(host.job(c).await.record.status, "running");
+        source.configure(config.clone());
+        gate.add_permits(4); // Two workers for each admitted job; no new job can start yet.
         host.wait(b, |job| job.record.status == "finished").await;
         host.wait(c, |job| job.record.status == "finished").await;
         assert_eq!(std::fs::read(dir.path().join("out/b.bin")).unwrap(), data);

@@ -34,6 +34,7 @@ pub(crate) struct FlakyServerConfig {
     pub(crate) stall_gets: usize,
     pub(crate) stall_after_bytes: usize,
     pub(crate) stall_duration: Duration,
+    pub(crate) body_gate: Option<Arc<tokio::sync::Semaphore>>,
     pub(crate) redirect: Option<String>,
     pub(crate) redirect_path: Option<String>,
     pub(crate) required_headers: Vec<(String, String)>,
@@ -71,6 +72,7 @@ impl FlakyServerConfig {
             stall_gets: 0,
             stall_after_bytes: 4096,
             stall_duration: Duration::from_millis(200),
+            body_gate: None,
             redirect: None,
             redirect_path: None,
             required_headers: Vec::new(),
@@ -323,6 +325,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
     state.peak_bodies.fetch_max(active, Ordering::Relaxed);
     let mut sending = Some(SendingBody(state));
     let mut stall = get_attempt.is_some_and(|attempt| attempt <= config.stall_gets);
+    let mut gate = config.body_gate.clone();
     while sent < send_limit {
         let chunk_end = (sent + config.chunk_size).min(send_limit);
         // Stop measuring before the final write can wake a new request on another CPU.
@@ -332,6 +335,14 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
         }
         stream.write_all(&body[sent..chunk_end]).await?;
         sent = chunk_end;
+        if sent >= config.stall_after_bytes && sent < send_limit && gate.is_some() {
+            gate.take()
+                .expect("pending body gate")
+                .acquire()
+                .await
+                .expect("test body gate")
+                .forget();
+        }
         if stall && sent >= config.stall_after_bytes && sent < send_limit {
             stall = false;
             tokio::time::sleep(config.stall_duration).await;
