@@ -9,8 +9,6 @@ use crate::http::{self, ClientFactory, HttpMeta};
 use crate::observation::Phase;
 use crate::segment::Segment;
 use eyre::{Context, Result};
-use futures_util::StreamExt;
-use std::cmp::min;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
@@ -133,30 +131,28 @@ pub(crate) async fn download_segment(
         if stop_signal != StopSignal::None {
             return Err(eyre::Report::new(stop_signal));
         }
-        let client = client_factory.client()?;
         let started = Instant::now();
         let response = controlled(
             &mut stop_rx,
-            http::get_range(&client, &url, start, Some(segment.end), meta.strong_etag()),
+            http::get_range(
+                &client_factory,
+                &url,
+                start,
+                Some(segment.end),
+                meta.strong_etag(),
+            ),
         )
         .await;
         let response = match response {
             Ok(resp) => resp,
             Err(err) => {
-                if err.downcast_ref::<StopSignal>().is_some() {
-                    return Err(err);
-                }
-                attempts += 1;
-                if attempts > 5 {
-                    return Err(err);
-                }
-                observation.retry();
-                let _retry = observation.timing(Phase::Retry);
-                let backoff = backoff_delay(attempts);
-                controlled(&mut stop_rx, async {
-                    tokio::time::sleep(backoff).await;
-                    Ok(())
-                })
+                wait_for_retry(
+                    &client_factory,
+                    &mut stop_rx,
+                    &mut attempts,
+                    err,
+                    &observation,
+                )
                 .await?;
                 continue;
             }
@@ -188,7 +184,7 @@ pub(crate) async fn download_segment(
                         return Err(eyre::Report::new(stop_signal));
                     }
                 }
-                next = stream.next() => {
+                next = http::next_chunk(&mut stream, client_factory.recovery.read_idle_timeout_ms) => {
                     match next {
                         Some(Ok(bytes)) => {
                             observation.received(bytes.len() as u64);
@@ -243,14 +239,7 @@ pub(crate) async fn download_segment(
                                 total_downloaded.fetch_sub(segment.downloaded - saved, Ordering::Relaxed);
                                 segment.downloaded = saved;
                             }
-                            attempts += 1;
-                            if attempts > 5 {
-                                return Err(eyre::eyre!("segment download failed: {err}"));
-                            }
-                            observation.retry();
-                            let _retry = observation.timing(Phase::Retry);
-                            let backoff = backoff_delay(attempts);
-                            controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
+                            wait_for_retry(&client_factory, &mut stop_rx, &mut attempts, err, &observation).await?;
                             start = segment.start + segment.downloaded;
                             break;
                         }
@@ -258,14 +247,7 @@ pub(crate) async fn download_segment(
                             file.flush().await?;
                             let expected = segment.end.saturating_sub(segment.start) + 1;
                             if segment.downloaded < expected {
-                                attempts += 1;
-                                if attempts > 5 {
-                                    return Err(eyre::eyre!("segment ended early"));
-                                }
-                                observation.retry();
-                                let _retry = observation.timing(Phase::Retry);
-                                let backoff = backoff_delay(attempts);
-                                controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
+                                wait_for_retry(&client_factory, &mut stop_rx, &mut attempts, http::HttpFailure::ShortBody.into(), &observation).await?;
                                 start = segment.start + segment.downloaded;
                                 break;
                             }
@@ -283,7 +265,7 @@ pub(crate) async fn download_segment(
         }
         if recycle {
             attempts += 1;
-            if attempts > 5 {
+            if attempts > client_factory.recovery.max_retries {
                 return Err(eyre::eyre!("segment recycling exceeded attempts"));
             }
             start = segment.start + segment.downloaded;
@@ -313,25 +295,17 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
             return Err(eyre::Report::new(stop_signal));
         }
 
-        let client = client_factory.client()?;
-        let response = controlled(&mut stop_rx, http::get_full(&client, &url)).await;
+        let response = controlled(&mut stop_rx, http::get_full(&client_factory, &url)).await;
         let response = match response {
             Ok(resp) => resp,
             Err(err) => {
-                if err.downcast_ref::<StopSignal>().is_some() {
-                    return Err(err);
-                }
-                attempts += 1;
-                if attempts > 5 {
-                    return Err(err);
-                }
-                observation.retry();
-                let _retry = observation.timing(Phase::Retry);
-                let backoff = backoff_delay(attempts);
-                controlled(&mut stop_rx, async {
-                    tokio::time::sleep(backoff).await;
-                    Ok(())
-                })
+                wait_for_retry(
+                    &client_factory,
+                    &mut stop_rx,
+                    &mut attempts,
+                    err,
+                    &observation,
+                )
                 .await?;
                 continue;
             }
@@ -364,7 +338,7 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                         return Err(eyre::Report::new(stop_signal));
                     }
                 }
-                next = stream.next() => {
+                next = http::next_chunk(&mut stream, client_factory.recovery.read_idle_timeout_ms) => {
                     match next {
                         Some(Ok(bytes)) => {
                             let len = bytes.len() as u64;
@@ -396,28 +370,14 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                         }
                         Some(Err(err)) => {
                             file.flush().await?;
-                            attempts += 1;
-                            if attempts > 5 {
-                                return Err(eyre::eyre!("download failed: {err}"));
-                            }
-                            observation.retry();
-                            let _retry = observation.timing(Phase::Retry);
-                            let backoff = backoff_delay(attempts);
-                            controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
+                            wait_for_retry(&client_factory, &mut stop_rx, &mut attempts, err, &observation).await?;
                             break;
                         }
                         None => {
                             file.flush().await?;
                             if let Some(expected) = expected {
                                 if offset != expected {
-                                    attempts += 1;
-                                    if attempts > 5 {
-                                        return Err(eyre::eyre!("download ended early"));
-                                    }
-                                    observation.retry();
-                                    let _retry = observation.timing(Phase::Retry);
-                                    let backoff = backoff_delay(attempts);
-                                    controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
+                                    wait_for_retry(&client_factory, &mut stop_rx, &mut attempts, http::HttpFailure::ShortBody.into(), &observation).await?;
                                     break;
                                 }
                             }
@@ -430,10 +390,20 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
     }
 }
 
-pub(crate) fn backoff_delay(attempt: u32) -> Duration {
-    let max = 10_000u64;
-    let base = 500u64;
-    let pow = 1u64 << min(attempt, 5);
-    let delay = base * pow;
-    Duration::from_millis(min(delay, max))
+pub(super) async fn wait_for_retry(
+    factory: &ClientFactory,
+    stop_rx: &mut watch::Receiver<StopSignal>,
+    attempts: &mut u32,
+    error: eyre::Report,
+    observation: &DownloadObservation,
+) -> Result<()> {
+    *attempts += 1;
+    let (reason, delay) = factory.retry_delay(*attempts, error)?;
+    observation.retry(reason, delay);
+    let _retry = observation.timing(Phase::Retry);
+    controlled(stop_rx, async {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    })
+    .await
 }

@@ -2,6 +2,7 @@
 
 use crate::DownloadObservation;
 use crate::error::{Error, Result};
+use crate::recovery::RetryBudget;
 use crate::{DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +19,15 @@ mod worker;
 
 pub(crate) use control::StopSignal;
 use engine::download_inner;
+
+/// Shared recovery admission for downloads owned by one host application.
+///
+/// Reuse a session across jobs to share rolling per-origin retry budgets. Separate sessions and
+/// the standalone functions do not share budgets. The host still owns the runtime and lifecycle.
+#[derive(Clone, Default)]
+pub struct DownloadSession {
+    budget: Arc<RetryBudget>,
+}
 
 /// Starts a download on a background task.
 ///
@@ -65,35 +75,56 @@ pub fn start_download_with_handle(
     handle: Handle,
     request: DownloadRequest,
 ) -> Result<DownloadHandle> {
-    let (tx, rx) = mpsc::channel(8);
-    let observation = DownloadObservation::new();
-    let task_observation = observation.clone();
-    let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
-    let join_stop_tx = stop_tx.clone();
-    let join = handle.spawn(async move {
-        let result = download_inner(
-            request,
-            Some(Arc::new(EventSender::new(tx, task_observation.clone()))),
-            join_stop_tx,
-            stop_rx,
-            task_observation.clone(),
-        )
-        .await
-        .map_err(map_download_error);
-        task_observation.finish(match &result {
-            Ok(_) => 1,
-            Err(Error::Paused) => 2,
-            Err(Error::Cancelled) => 3,
-            Err(_) => 4,
+    DownloadSession::default().start_with_handle(handle, request)
+}
+
+impl DownloadSession {
+    /// Starts a download on the current Tokio runtime, sharing this session's retry budgets.
+    pub fn start(&self, request: DownloadRequest) -> Result<DownloadHandle> {
+        let handle = Handle::try_current()
+            .map_err(|_| Error::runtime_unavailable("start requires a Tokio runtime"))?;
+        self.start_with_handle(handle, request)
+    }
+
+    /// Starts on the host-selected runtime. Invalid recovery settings fail before spawning.
+    pub fn start_with_handle(
+        &self,
+        handle: Handle,
+        request: DownloadRequest,
+    ) -> Result<DownloadHandle> {
+        request.recovery.validate()?;
+        let budget = self.budget.clone();
+        let (tx, rx) = mpsc::channel(8);
+        let observation = DownloadObservation::new();
+        let task_observation = observation.clone();
+        let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
+        let join_stop_tx = stop_tx.clone();
+        let join = handle.spawn(async move {
+            let result = download_inner(
+                request,
+                Some(Arc::new(EventSender::new(tx, task_observation.clone()))),
+                join_stop_tx,
+                stop_rx,
+                task_observation.clone(),
+                budget,
+            )
+            .await
+            .map_err(map_download_error);
+            task_observation.finish(match &result {
+                Ok(_) => 1,
+                Err(Error::Paused) => 2,
+                Err(Error::Cancelled) => 3,
+                Err(_) => 4,
+            });
+            result
         });
-        result
-    });
-    Ok(DownloadHandle {
-        events: rx,
-        observation,
-        join,
-        control: DownloadControl { stop_tx },
-    })
+        Ok(DownloadHandle {
+            events: rx,
+            observation,
+            join,
+            control: DownloadControl { stop_tx },
+        })
+    }
 }
 
 /// Runs a download without emitting events.
@@ -115,10 +146,18 @@ pub fn start_download_with_handle(
 /// # Ok(()) }
 /// ```
 pub async fn download(request: DownloadRequest) -> Result<DownloadSummary> {
+    request.recovery.validate()?;
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
-    download_inner(request, None, stop_tx, stop_rx, DownloadObservation::new())
-        .await
-        .map_err(map_download_error)
+    download_inner(
+        request,
+        None,
+        stop_tx,
+        stop_rx,
+        DownloadObservation::new(),
+        Arc::new(RetryBudget::default()),
+    )
+    .await
+    .map_err(map_download_error)
 }
 
 fn map_download_error(err: eyre::Report) -> Error {
@@ -130,11 +169,13 @@ fn map_download_error(err: eyre::Report) -> Error {
         };
     }
 
-    let message = err.to_string();
+    let message = format!("{err:#}");
     if err.downcast_ref::<url::ParseError>().is_some() {
         return Error::InvalidUrl { message };
     }
-    if err.downcast_ref::<reqwest::Error>().is_some() {
+    if err.downcast_ref::<reqwest::Error>().is_some()
+        || err.downcast_ref::<crate::http::HttpFailure>().is_some()
+    {
         return Error::Http { message };
     }
     if err.downcast_ref::<std::io::Error>().is_some() {
@@ -199,7 +240,6 @@ mod tests {
     use super::send_event;
     #[cfg(feature = "serde")]
     use super::state::{DownloadState, load_state, save_state};
-    use super::worker::backoff_delay;
     use crate::DownloadEvent;
     use crate::http::HttpMeta;
     #[cfg(feature = "serde")]
@@ -295,13 +335,21 @@ mod tests {
 
     #[test]
     fn test_backoff_delay_caps_at_max() {
-        let delay = backoff_delay(6);
+        let delay = crate::RecoveryPolicy {
+            jitter_ms: 0,
+            ..Default::default()
+        }
+        .delay(6);
         assert_eq!(delay, Duration::from_millis(10_000));
     }
 
     #[test]
     fn test_backoff_delay_first_attempt() {
-        let delay = backoff_delay(1);
+        let delay = crate::RecoveryPolicy {
+            jitter_ms: 0,
+            ..Default::default()
+        }
+        .delay(1);
         assert_eq!(delay, Duration::from_millis(1_000));
     }
 

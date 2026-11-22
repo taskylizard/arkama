@@ -456,6 +456,7 @@ mod tests {
             user_agent: None,
             limit: None,
             experimental_entropy: false,
+            recovery: Default::default(),
         }
     }
 

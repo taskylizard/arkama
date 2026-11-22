@@ -18,6 +18,7 @@ fn request(url: String, path: PathBuf, connections: usize) -> DownloadRequest {
         user_agent: None,
         limit: None,
         experimental_entropy: false,
+        recovery: Default::default(),
     }
 }
 
@@ -71,6 +72,297 @@ fn asymmetric_data(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| ((index * 31 + index / 251 + index / 65537) % 256) as u8)
         .collect()
+}
+
+fn quick_recovery() -> arkama_core::RecoveryPolicy {
+    arkama_core::RecoveryPolicy {
+        base_delay_ms: 5,
+        jitter_ms: 0,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn recovery_retries_temporary_statuses_not_permanent_failures() {
+    let data = asymmetric_data(16_387);
+    for status in [401, 403, 404, 416, 501, 505, 408, 429, 500, 502, 503, 504] {
+        let mut config = FlakyServerConfig::new(data.clone());
+        config.status = status;
+        config.status_gets = 1;
+        let server = FlakyServer::spawn(config).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.bin");
+        let handle =
+            start_download(request(server.url(), path.clone(), 1).recovery(quick_recovery()))
+                .unwrap();
+        let observation = handle.observation;
+        let result = timeout(Duration::from_secs(3), handle.join)
+            .await
+            .unwrap()
+            .unwrap();
+        let temporary = matches!(status, 408 | 429 | 500 | 502 | 503 | 504);
+        if temporary {
+            result.unwrap();
+            assert_downloaded(&path, &data).await;
+            assert_eq!(observation.snapshot().retries, 1);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&status.to_string())
+            );
+            assert!(!path.exists());
+            assert_eq!(observation.snapshot().retries, 0);
+        }
+        assert_eq!(
+            server.stats().range_get_requests,
+            if temporary { 2 } else { 1 }
+        );
+    }
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.status_heads = 2;
+    let server = FlakyServer::spawn(config).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("probe.bin");
+    download(request(server.url(), path.clone(), 1).recovery(quick_recovery()))
+        .await
+        .unwrap();
+    assert_downloaded(&path, &data).await;
+    assert_eq!(server.stats().head_requests, 3);
+}
+
+#[tokio::test]
+async fn recovery_honors_retry_after_and_refuses_an_excessive_wait() {
+    let data = asymmetric_data(16_387);
+    for excessive in [false, true] {
+        let mut config = FlakyServerConfig::new(data.clone());
+        config.status = 429;
+        config.status_gets = 1;
+        config.retry_after = Some("1".into());
+        let server = FlakyServer::spawn(config).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("throttle.bin");
+        let mut policy = quick_recovery();
+        policy.max_delay_ms = if excessive { 50 } else { 2000 };
+        let started = std::time::Instant::now();
+        let handle =
+            start_download(request(server.url(), path.clone(), 1).recovery(policy)).unwrap();
+        let observation = handle.observation;
+        let result = timeout(Duration::from_secs(4), handle.join)
+            .await
+            .unwrap()
+            .unwrap();
+        if excessive {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Retry-After exceeds")
+            );
+            assert_eq!(server.stats().range_get_requests, 1);
+            assert!(!path.exists());
+        } else {
+            result.unwrap();
+            assert!(
+                started.elapsed() >= Duration::from_secs(1),
+                "must not retry before the server's minimum wait"
+            );
+            assert_eq!(observation.snapshot().last_retry_delay_ms, 1000);
+            assert_eq!(
+                observation.snapshot().last_recovery_reason,
+                Some("server throttling")
+            );
+            assert_downloaded(&path, &data).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_preserves_correct_bytes_after_disconnects_and_idle_reads() {
+    let data = asymmetric_data(16_387);
+    for ranges in [false, true] {
+        for stall in [false, true] {
+            let mut config = FlakyServerConfig::new(data.clone());
+            config.accept_ranges = ranges;
+            config.chunk_size = 4096;
+            if stall {
+                config.stall_gets = 1;
+            } else {
+                config.interrupt_range_gets = 1;
+                config.interrupt_full_gets = 1;
+                config.interrupt_after_bytes = 4096;
+            }
+            let server = FlakyServer::spawn(config).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("recover.bin");
+            let mut policy = quick_recovery();
+            policy.read_idle_timeout_ms = 30;
+            let handle =
+                start_download(request(server.url(), path.clone(), 1).recovery(policy)).unwrap();
+            let observation = handle.observation;
+            timeout(Duration::from_secs(3), handle.join)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_downloaded(&path, &data).await;
+            assert_eq!(observation.snapshot().retries, 1);
+            assert_eq!(observation.snapshot().network_stalls, u64::from(stall));
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_deadlines_are_bounded_and_exclude_intentional_throttling() {
+    let data = asymmetric_data(8195);
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.header_delay = Duration::from_secs(1);
+    let server = FlakyServer::spawn(config).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deadline.bin");
+    let mut policy = quick_recovery();
+    policy.setup_timeout_ms = 30;
+    policy.max_retries = 1;
+    let result = timeout(
+        Duration::from_secs(1),
+        download(request(server.url(), path.clone(), 1).recovery(policy)),
+    )
+    .await
+    .unwrap();
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("deadline") && message.contains("retry limit"),
+        "{message}"
+    );
+    assert_eq!(server.stats().head_requests, 2);
+    assert!(!partial_path(&path).exists());
+
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 4096;
+    let server = FlakyServer::spawn(config).await;
+    let mut policy = quick_recovery();
+    policy.read_idle_timeout_ms = 20;
+    let handle = start_download(
+        request(server.url(), path.clone(), 1)
+            .speed_limit(8192)
+            .recovery(policy),
+    )
+    .unwrap();
+    let observation = handle.observation;
+    timeout(Duration::from_secs(3), handle.join)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_downloaded(&path, &data).await;
+    assert_eq!(observation.snapshot().retries, 0);
+    assert!(observation.snapshot().durations_ms["throttle_wait"] > 100);
+
+    let mut invalid = request(server.url(), dir.path().join("invalid.bin"), 1);
+    invalid.recovery.connect_timeout_ms = 0;
+    assert!(matches!(
+        start_download(invalid),
+        Err(arkama_core::Error::InvalidRequest { .. })
+    ));
+}
+
+#[tokio::test]
+async fn recovery_sessions_share_host_budgets_not_other_origins() {
+    let mut config = FlakyServerConfig::new(asymmetric_data(8195));
+    config.status_heads = usize::MAX;
+    let server = FlakyServer::spawn(config.clone()).await;
+    let other = FlakyServer::spawn(config).await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = arkama_core::DownloadSession::default();
+    let mut policy = quick_recovery();
+    policy.max_host_retries = 1;
+    let first = session
+        .start(request(server.url(), dir.path().join("first.bin"), 1).recovery(policy.clone()))
+        .unwrap();
+    let second = session
+        .clone()
+        .start(request(server.url(), dir.path().join("second.bin"), 1).recovery(policy.clone()))
+        .unwrap();
+    let (first, second) = tokio::join!(first.join, second.join);
+    let errors = [
+        first.unwrap().unwrap_err().to_string(),
+        second.unwrap().unwrap_err().to_string(),
+    ];
+    assert!(
+        errors
+            .iter()
+            .all(|message| message.contains("host retry budget exhausted"))
+    );
+    assert_eq!(
+        server.stats().head_requests,
+        3,
+        "two initial requests and one shared retry"
+    );
+    let result = session
+        .start(request(other.url(), dir.path().join("other.bin"), 1).recovery(policy.clone()))
+        .unwrap()
+        .join
+        .await
+        .unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("host retry budget exhausted")
+    );
+    assert_eq!(other.stats().head_requests, 2);
+    policy.host_window_ms = 1;
+    policy.max_retries = 1;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let result = session
+        .start(request(server.url(), dir.path().join("later.bin"), 1).recovery(policy))
+        .unwrap()
+        .join
+        .await
+        .unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("retry limit exhausted")
+    );
+    assert_eq!(
+        server.stats().head_requests,
+        5,
+        "expired debt allows one new retry"
+    );
+
+    let mut config = FlakyServerConfig::new(asymmetric_data(16_387));
+    config.interrupt_range_gets = 100;
+    config.interrupt_after_bytes = 4096;
+    let target = FlakyServer::spawn(config.clone()).await;
+    config.redirect = Some(target.url());
+    let source = FlakyServer::spawn(config.clone()).await;
+    let alias = FlakyServer::spawn(config).await;
+    let mut policy = quick_recovery();
+    policy.max_host_retries = 1;
+    let first = session
+        .start(request(source.url(), dir.path().join("redirect.bin"), 1).recovery(policy.clone()))
+        .unwrap();
+    let second = session
+        .start(request(alias.url(), dir.path().join("alias.bin"), 1).recovery(policy))
+        .unwrap();
+    let (first, second) = tokio::join!(first.join, second.join);
+    for result in [first, second] {
+        assert!(
+            result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("host retry budget exhausted")
+        );
+    }
+    assert_eq!(
+        target.stats().range_get_requests,
+        3,
+        "redirect aliases must share the final origin's body retry budget"
+    );
 }
 
 #[tokio::test]

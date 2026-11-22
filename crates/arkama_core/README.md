@@ -173,6 +173,63 @@ Use `DownloadRequest::speed_limit(bytes_per_second)` or the builder's `speed_lim
 approximate byte-per-second cap shared by the workers of one download. This is not an
 application-wide cap across multiple jobs.
 
+## Recovery policy
+
+Every request has a `RecoveryPolicy`. Omitted fields in persisted JSON use defaults; Rust struct
+literals must now include `recovery: Default::default()` or use the request constructor/builder.
+Invalid policies return `Error::InvalidRequest` before an attempt is spawned or touches the network.
+
+| Setting | Default |
+| --- | --- |
+| `connect_timeout_ms` | 10,000; includes connection establishment and TLS |
+| `setup_timeout_ms` | 30,000; connection, redirects, and response headers |
+| `read_idle_timeout_ms` | 30,000; waiting for the next HTTP body chunk only |
+| `max_retries` | 5 per probe or transfer worker; 0 disables retries |
+| `base_delay_ms`, `max_delay_ms` | 500, 10,000; exponential delay starts at twice the base |
+| `jitter_ms` | 250; uniform additional delay, capped at maximum wait |
+| `max_host_retries`, `host_window_ms` | 30 retries admitted per origin over a rolling 60,000 ms |
+
+Deadlines, maximum wait, and host windows must be 1 ms–1 hour. Base delay and jitter must not exceed
+maximum wait; retry limits are at most 1,000 per worker and 10,000 per host. Zero host retries refuses
+all recovery. Retries include waits admitted but interrupted by controls; successful requests do not
+consume the host retry budget.
+
+Connection/header/read-idle failures, interrupted HTTP framing, short bodies, and HTTP 408, 429,
+500, 502, 503, 504 can recover. Other HTTP errors, invalid ranges, changed identity, excess body
+coverage, encoding errors, and filesystem errors stop instead of repeatedly replaying invalid work.
+401/403/404 errors suggest checking credentials or the link; automatic expired-link refresh is not
+provided. Only replayable HTTP GET downloads are supported. Experimental entropy remains opt-in.
+
+Valid numeric or HTTP-date `Retry-After` values set a minimum wait. If that exceeds `max_delay_ms`,
+the attempt fails with an actionable retry-later error rather than retrying before the server permits.
+Malformed values are ignored. Network-idle timers do not run during rate limiting or disk writes.
+Pause/cancel interrupt setup and backoff; workers still finish in-flight disk work before acknowledging.
+
+```rust,no_run
+use arkama_core::{DownloadRequest, DownloadSession, RecoveryPolicy};
+
+#[tokio::main]
+async fn main() -> arkama_core::Result<()> {
+    let session = DownloadSession::default(); // Keep and share this across the application's jobs.
+    let policy = RecoveryPolicy { read_idle_timeout_ms: 60_000, ..Default::default() };
+    let handle = session.start(DownloadRequest::new("https://example.com/file.bin").recovery(policy))?;
+    let summary = handle.join.await.expect("host kept runtime alive")?;
+    println!("saved {} bytes", summary.downloaded_bytes);
+    Ok(())
+}
+```
+
+Cloned sessions share per-origin retry budgets. Standalone download functions create a fresh budget
+per attempt; applications managing several jobs should reuse a session, as the daemon does. Budgets
+are process-local and reset with a new session/restart; they are not a connection or bandwidth cap.
+HTTP status failures use the response origin; connection/body failures use the known attempt origin.
+Retry history is bounded to 1,024 origins and 10,000 entries per origin, with entries retained for at
+most an hour to support different request windows. Capacity exhaustion fails recovery explicitly.
+
+Observation snapshots expose the latest admitted recovery reason and delay, retry count, and admitted
+read-idle stalls without URL/header/error strings. Final errors and acknowledgements remain available
+through `join`, not optional events. Shared persistent job-state integration follows in the manager.
+
 ## Feature flags
 
 Default features:

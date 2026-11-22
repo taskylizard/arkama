@@ -83,6 +83,7 @@ async fn download_single_and_segmented_resume() {
         user_agent: None,
         limit: None,
         experimental_entropy: false,
+        recovery: Default::default(),
     };
     let summary = download(req.clone()).await.unwrap();
     assert_eq!(summary.total_bytes, data.len() as u64);

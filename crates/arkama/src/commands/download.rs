@@ -71,6 +71,7 @@ fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>>
         connections,
         user_agent,
         limit,
+        recovery,
         experimental_entropy,
         daemon: _,
         silent: _,
@@ -81,6 +82,7 @@ fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>>
     let output_dir = resolve_output_dir(db)?;
     let connections = resolve_connections(connections, db.get_setting("connections")?)?;
     let limit = resolve_speed_limit(limit, db.get_setting("speed_limit")?)?;
+    let recovery = recovery.unwrap_or_default();
 
     let Some(links_file) = links_file else {
         let Some(url) = url else {
@@ -94,6 +96,7 @@ fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>>
             user_agent,
             limit,
             experimental_entropy,
+            recovery,
         }]);
     };
 
@@ -116,6 +119,7 @@ fn resolve_requests(db: &Db, args: DownloadArgs) -> Result<Vec<DownloadRequest>>
             user_agent: user_agent.clone(),
             limit,
             experimental_entropy,
+            recovery: recovery.clone(),
         });
     }
 

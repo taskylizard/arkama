@@ -38,6 +38,8 @@ pub struct DownloadRequest {
     pub user_agent: Option<String>,
     pub limit: Option<u64>,
     pub experimental_entropy: bool,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub recovery: crate::RecoveryPolicy,
 }
 
 impl DownloadRequest {
@@ -64,6 +66,7 @@ impl DownloadRequest {
             user_agent: None,
             limit: None,
             experimental_entropy: false,
+            recovery: crate::RecoveryPolicy::default(),
         }
     }
 
@@ -111,6 +114,12 @@ impl DownloadRequest {
     /// This mode is intended for LACP/ECMP environments and may increase connection churn.
     pub fn experimental_entropy(mut self, enabled: bool) -> Self {
         self.experimental_entropy = enabled;
+        self
+    }
+
+    /// Sets validated network deadlines and recovery bounds.
+    pub fn recovery(mut self, recovery: crate::RecoveryPolicy) -> Self {
+        self.recovery = recovery;
         self
     }
 
@@ -199,6 +208,12 @@ impl DownloadRequestBuilder {
     /// Enables or disables experimental connection entropy mode.
     pub fn experimental_entropy(mut self, enabled: bool) -> Self {
         self.request = self.request.experimental_entropy(enabled);
+        self
+    }
+
+    /// Sets network deadlines and recovery bounds.
+    pub fn recovery(mut self, recovery: crate::RecoveryPolicy) -> Self {
+        self.request = self.request.recovery(recovery);
         self
     }
 

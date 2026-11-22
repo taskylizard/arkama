@@ -1,11 +1,17 @@
+use crate::RecoveryPolicy;
+use crate::recovery::{RecoveryReason, RetryBudget};
 use eyre::{Context, Result};
+use futures_util::{Stream, StreamExt};
 use reqwest::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
+    RETRY_AFTER,
 };
 use reqwest::redirect::Policy;
-use reqwest::{Client, Response, StatusCode};
-use std::time::Duration;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -35,25 +41,181 @@ impl HttpMeta {
 #[derive(Clone)]
 pub(crate) struct ClientFactory {
     base: Client,
+    pub(crate) recovery: RecoveryPolicy,
+    budget: Arc<RetryBudget>,
+    pub(crate) origin: String,
 }
 
 impl ClientFactory {
-    pub(crate) fn new(user_agent: Option<&str>, experimental_entropy: bool) -> Result<Self> {
-        let base = build_client(user_agent, experimental_entropy)?;
-        Ok(Self { base })
+    pub(crate) fn new(
+        user_agent: Option<&str>,
+        experimental_entropy: bool,
+        recovery: RecoveryPolicy,
+        budget: Arc<RetryBudget>,
+        url: &Url,
+    ) -> Result<Self> {
+        let base = build_client(user_agent, experimental_entropy, &recovery)?;
+        Ok(Self {
+            base,
+            recovery,
+            budget,
+            origin: url.origin().ascii_serialization(),
+        })
     }
 
-    pub(crate) fn client(&self) -> Result<Client> {
-        Ok(self.base.clone())
+    async fn send(&self, request: RequestBuilder) -> Result<Response> {
+        tokio::time::timeout(
+            Duration::from_millis(self.recovery.setup_timeout_ms),
+            request.send(),
+        )
+        .await
+        .map_err(|_| HttpFailure::SetupTimeout)?
+        .map_err(|error| error.without_url().into())
+    }
+
+    pub(crate) fn retry_delay(
+        &self,
+        attempt: u32,
+        error: eyre::Report,
+    ) -> Result<(RecoveryReason, Duration)> {
+        let (reason, server_wait, origin) =
+            if let Some(failure) = error.downcast_ref::<HttpFailure>() {
+                let Some(reason) = failure.reason() else {
+                    return Err(error);
+                };
+                match failure {
+                    HttpFailure::Status {
+                        retry_after,
+                        origin,
+                        ..
+                    } => (reason, *retry_after, origin.as_str()),
+                    _ => (reason, None, self.origin.as_str()),
+                }
+            } else if let Some(failure) = error.downcast_ref::<reqwest::Error>() {
+                // Reqwest classifies premature HTTP body EOF as Decode, even with decoding off.
+                let reason = if failure.is_connect() || failure.is_timeout() {
+                    RecoveryReason::Connection
+                } else if failure.is_body() || failure.is_decode() {
+                    RecoveryReason::Body
+                } else {
+                    return Err(error);
+                };
+                (reason, None, self.origin.as_str())
+            } else {
+                return Err(error);
+            };
+        if attempt > self.recovery.max_retries {
+            return Err(error.wrap_err("retry limit exhausted"));
+        }
+        let delay = self
+            .recovery
+            .delay(attempt)
+            .max(server_wait.unwrap_or_default());
+        if delay > Duration::from_millis(self.recovery.max_delay_ms) {
+            return Err(error.wrap_err("Retry-After exceeds maximum wait; retry later"));
+        }
+        self.budget
+            .reserve(origin, &self.recovery)
+            .map_err(|limit| error.wrap_err(limit))?;
+        Ok((reason, delay))
     }
 }
 
-fn build_client(user_agent: Option<&str>, experimental_entropy: bool) -> Result<Client> {
+#[derive(Debug)]
+pub(crate) enum HttpFailure {
+    SetupTimeout,
+    ReadIdle,
+    ShortBody,
+    Status {
+        status: StatusCode,
+        retry_after: Option<Duration>,
+        origin: String,
+    },
+}
+
+impl HttpFailure {
+    fn reason(&self) -> Option<RecoveryReason> {
+        match self {
+            Self::SetupTimeout => Some(RecoveryReason::SetupTimeout),
+            Self::ReadIdle => Some(RecoveryReason::ReadIdle),
+            Self::ShortBody => Some(RecoveryReason::ShortBody),
+            Self::Status { status, .. } => match status.as_u16() {
+                429 => Some(RecoveryReason::Throttled),
+                408 | 500 | 502 | 503 | 504 => Some(RecoveryReason::TemporaryServer),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SetupTimeout => f.write_str("connection/header deadline exceeded"),
+            Self::ReadIdle => f.write_str("network read idle deadline exceeded"),
+            Self::ShortBody => f.write_str("HTTP body ended early"),
+            Self::Status { status, .. } => {
+                write!(f, "HTTP {status}")?;
+                if matches!(status.as_u16(), 401 | 403 | 404) {
+                    f.write_str("; check credentials or link")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
+fn check_status(response: Response) -> Result<Response> {
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .map(Duration::from_secs)
+                    .or_else(|| {
+                        httpdate::parse_http_date(value)
+                            .ok()
+                            .map(|date| date.duration_since(SystemTime::now()).unwrap_or_default())
+                    })
+            });
+        return Err(HttpFailure::Status {
+            status,
+            retry_after,
+            origin: response.url().origin().ascii_serialization(),
+        }
+        .into());
+    }
+    Ok(response)
+}
+
+pub(crate) async fn next_chunk<S, T>(stream: &mut S, idle_ms: u64) -> Option<Result<T>>
+where
+    S: Stream<Item = std::result::Result<T, reqwest::Error>> + Unpin,
+{
+    match tokio::time::timeout(Duration::from_millis(idle_ms), stream.next()).await {
+        Ok(next) => next.map(|result| result.map_err(|error| error.without_url().into())),
+        Err(_) => Some(Err(HttpFailure::ReadIdle.into())),
+    }
+}
+
+fn build_client(
+    user_agent: Option<&str>,
+    experimental_entropy: bool,
+    recovery: &RecoveryPolicy,
+) -> Result<Client> {
     let user_agent = user_agent.unwrap_or("arkama/0.1");
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let mut builder = Client::builder()
         .user_agent(user_agent)
+        .connect_timeout(Duration::from_millis(recovery.connect_timeout_ms))
         .default_headers(headers)
         .no_gzip()
         .no_brotli()
@@ -68,7 +230,7 @@ fn build_client(user_agent: Option<&str>, experimental_entropy: bool) -> Result<
     Ok(client)
 }
 
-pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
+pub(crate) async fn probe(factory: &ClientFactory, url: &Url) -> Result<HttpMeta> {
     let mut size = None;
     let mut accept_ranges = false;
     let mut filename = None;
@@ -77,8 +239,14 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
     let mut mime_type = None;
     let mut final_url = url.to_string();
 
-    let head = client.head(url.clone()).send().await;
-    let head = head.ok().filter(|response| response.status().is_success());
+    let head = factory.send(factory.base.head(url.clone())).await?;
+    // HEAD may be unsupported even when GET works; temporary failures must not be bypassed.
+    let head = if matches!(head.status().as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+        check_status(head)?
+    } else {
+        head
+    };
+    let head = head.status().is_success().then_some(head);
 
     if let Some(resp) = head {
         validate_identity_encoding(&resp)?;
@@ -96,25 +264,11 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
     }
 
     if !accept_ranges {
-        let probe = client
-            .get(url.clone())
-            .header(RANGE, "bytes=0-0")
-            .send()
-            .await;
-        let probe = match probe {
-            Ok(resp) => resp,
-            Err(_) => {
-                return Ok(HttpMeta {
-                    size,
-                    accept_ranges: false,
-                    filename,
-                    etag,
-                    last_modified,
-                    mime_type,
-                    final_url,
-                });
-            }
-        };
+        let probe = check_status(
+            factory
+                .send(factory.base.get(url.clone()).header(RANGE, "bytes=0-0"))
+                .await?,
+        )?;
         validate_identity_encoding(&probe)?;
         final_url = probe.url().to_string();
         if probe.status() == StatusCode::PARTIAL_CONTENT {
@@ -147,7 +301,7 @@ pub(crate) async fn probe(client: &Client, url: &Url) -> Result<HttpMeta> {
 }
 
 pub(crate) async fn get_range(
-    client: &Client,
+    factory: &ClientFactory,
     url: &Url,
     start: u64,
     end: Option<u64>,
@@ -157,28 +311,15 @@ pub(crate) async fn get_range(
         Some(end) => format!("bytes={start}-{end}"),
         None => format!("bytes={start}-"),
     };
-    let mut request = client.get(url.clone()).header(RANGE, range);
+    let mut request = factory.base.get(url.clone()).header(RANGE, range);
     if let Some(if_range) = if_range {
         request = request.header(IF_RANGE, HeaderValue::from_str(if_range)?);
     }
-    let resp = request
-        .send()
-        .await
-        .context("range request failed")?
-        .error_for_status()
-        .context("range response error")?;
-    Ok(resp)
+    check_status(factory.send(request).await?)
 }
 
-pub(crate) async fn get_full(client: &Client, url: &Url) -> Result<Response> {
-    let resp = client
-        .get(url.clone())
-        .send()
-        .await
-        .context("request failed")?
-        .error_for_status()
-        .context("response error")?;
-    Ok(resp)
+pub(crate) async fn get_full(factory: &ClientFactory, url: &Url) -> Result<Response> {
+    check_status(factory.send(factory.base.get(url.clone())).await?)
 }
 
 pub(crate) fn validate_identity_encoding(response: &Response) -> Result<()> {

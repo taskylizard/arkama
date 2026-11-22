@@ -14,6 +14,8 @@ pub enum Error {
     Cancelled,
     /// The request URL could not be parsed.
     InvalidUrl { message: String },
+    /// Request configuration is invalid.
+    InvalidRequest { message: String },
     /// An HTTP request or response failed.
     Http { message: String },
     /// File or filesystem I/O failed.
@@ -56,6 +58,7 @@ impl fmt::Display for Error {
             Self::Paused => write!(f, "interrupted"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::InvalidUrl { message }
+            | Self::InvalidRequest { message }
             | Self::Http { message }
             | Self::Io { message }
             | Self::State { message }

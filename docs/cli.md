@@ -25,6 +25,7 @@ Use `arkama-cli download --help` for the full argument reference:
 | `--connections <N>` | Workers per download; configured value, otherwise 4. |
 | `--user-agent <UA>` | Override the HTTP User-Agent. |
 | `--limit <BYTES_PER_SEC>` | Per-download speed cap; accepts values such as `2MB` or `500KB`. |
+| `--recovery-policy <JSON>` | Validated deadlines/retry policy; omitted fields keep core defaults. |
 | `--daemon` | Enqueue instead of downloading in this process. |
 | `--silent` | Suppress progress and summary output. Errors still fail the command. |
 | `--json` | Emit machine-readable events to stdout. Cannot be combined with `--silent`. |
@@ -35,6 +36,21 @@ The speed cap is shared across the workers of **one download**, not across all a
 JSON progress and terminal updates are sampled at most once per 500 ms. Optional core notifications
 use a bounded buffer and may be dropped under overload; the CLI obtains the exact final result from
 the independent completion handle.
+
+### Network recovery
+
+```sh
+arkama-cli download https://example.com/file.bin --recovery-policy '{"read_idle_timeout_ms":60000,"max_retries":8}'
+arkama-cli add https://example.com/file.bin --recovery-policy '{"max_retries":0}'
+```
+
+The same policy is used for direct and queued downloads and persists with queued requests. Defaults
+are a 10 s connection deadline, 30 s connection/header deadline, 30 s network-read idle deadline,
+five retries, exponential backoff capped at 10 s, and up to 250 ms jitter. The daemon shares a rolling
+30-retry budget per origin per minute across its jobs. Independent direct processes do not share it.
+Permanent HTTP errors and invalid transfer data are not retried. `Retry-After` is honored unless it
+exceeds the maximum wait, in which case Arkama stops and asks you to retry later. Limiter and disk
+waits do not count as network idle. See [all settings and bounds](../crates/arkama_core/README.md#recovery-policy).
 
 ## Pause and resume a direct download
 

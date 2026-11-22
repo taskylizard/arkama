@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use arkama_core::{
-    DownloadControl, DownloadEvent, DownloadRequest, DownloadSummary, start_download_with_handle,
+    DownloadControl, DownloadEvent, DownloadRequest, DownloadSession, DownloadSummary,
 };
 use arkama_data::{Db, daemon_addr_path, daemon_log_path};
 use clap::Subcommand;
@@ -76,6 +76,7 @@ impl Drop for AddrFileGuard {
 
 struct DaemonState {
     runtime: Handle,
+    session: DownloadSession,
     db: Db,
     max_concurrent: usize,
     active: Vec<ActiveDownload>,
@@ -94,6 +95,7 @@ impl DaemonState {
 
         Ok(Self {
             runtime,
+            session: DownloadSession::default(),
             db,
             max_concurrent,
             active: Vec::new(),
@@ -168,7 +170,9 @@ impl DaemonState {
     }
 
     fn start_one(&mut self, id: i64, request: DownloadRequest) -> Result<()> {
-        let handle = start_download_with_handle(self.runtime.clone(), request.clone())?;
+        let handle = self
+            .session
+            .start_with_handle(self.runtime.clone(), request.clone())?;
 
         let (done_tx, done_rx) = mpsc::channel();
         let join = handle.join;

@@ -39,6 +39,8 @@ pub(super) struct QueuedDownloadRequest {
     user_agent: Option<String>,
     limit: Option<u64>,
     experimental_entropy: bool,
+    #[serde(default)]
+    recovery: arkama_core::RecoveryPolicy,
 }
 
 impl From<DownloadRequest> for QueuedDownloadRequest {
@@ -51,6 +53,7 @@ impl From<DownloadRequest> for QueuedDownloadRequest {
             user_agent,
             limit,
             experimental_entropy,
+            recovery,
         } = request;
         Self {
             url,
@@ -60,6 +63,7 @@ impl From<DownloadRequest> for QueuedDownloadRequest {
             user_agent,
             limit,
             experimental_entropy,
+            recovery,
         }
     }
 }
@@ -74,6 +78,7 @@ impl From<QueuedDownloadRequest> for DownloadRequest {
             user_agent,
             limit,
             experimental_entropy,
+            recovery,
         } = request;
         Self {
             url,
@@ -83,6 +88,7 @@ impl From<QueuedDownloadRequest> for DownloadRequest {
             user_agent,
             limit,
             experimental_entropy,
+            recovery,
         }
     }
 }

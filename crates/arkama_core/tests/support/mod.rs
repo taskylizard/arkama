@@ -26,6 +26,14 @@ pub(crate) struct FlakyServerConfig {
     pub(crate) extra_range_bytes: usize,
     pub(crate) header_delay: Duration,
     pub(crate) range_header_start: Option<u64>,
+    pub(crate) status: u16,
+    pub(crate) status_heads: usize,
+    pub(crate) status_gets: usize,
+    pub(crate) retry_after: Option<String>,
+    pub(crate) stall_gets: usize,
+    pub(crate) stall_after_bytes: usize,
+    pub(crate) stall_duration: Duration,
+    pub(crate) redirect: Option<String>,
 }
 
 impl FlakyServerConfig {
@@ -50,6 +58,14 @@ impl FlakyServerConfig {
             extra_range_bytes: 0,
             header_delay: Duration::ZERO,
             range_header_start: None,
+            status: 503,
+            status_heads: 0,
+            status_gets: 0,
+            retry_after: None,
+            stall_gets: 0,
+            stall_after_bytes: 4096,
+            stall_duration: Duration::from_millis(200),
+            redirect: None,
         }
     }
 }
@@ -154,10 +170,11 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
 
     let mut full_get_attempt = None;
     let mut range_get_attempt = None;
+    let mut head_attempt = None;
 
     match request.method {
         HttpMethod::Head => {
-            state.head_requests.fetch_add(1, Ordering::Relaxed);
+            head_attempt = Some(state.head_requests.fetch_add(1, Ordering::Relaxed) + 1);
         }
         HttpMethod::Get => match request.range {
             Some(_) => {
@@ -172,6 +189,22 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
     }
 
     let config = state.config.read().unwrap().clone();
+    let get_attempt = full_get_attempt.or(range_get_attempt);
+    if let Some(location) = &config.redirect {
+        stream.write_all(format!("HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\nLocation: {location}\r\n\r\n").as_bytes()).await?;
+        return Ok(());
+    }
+    if head_attempt.is_some_and(|attempt| attempt <= config.status_heads)
+        || get_attempt.is_some_and(|attempt| attempt <= config.status_gets)
+    {
+        let retry_after = config
+            .retry_after
+            .as_ref()
+            .map(|value| format!("Retry-After: {value}\r\n"))
+            .unwrap_or_default();
+        stream.write_all(format!("HTTP/1.1 {} Failure\r\nContent-Length: 0\r\nConnection: close\r\n{retry_after}\r\n", config.status).as_bytes()).await?;
+        return Ok(());
+    }
     let data = &config.data;
     let body_range = select_body_range(
         data.len(),
@@ -231,10 +264,15 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> io
     };
 
     let mut sent = 0usize;
+    let mut stall = get_attempt.is_some_and(|attempt| attempt <= config.stall_gets);
     while sent < send_limit {
         let chunk_end = (sent + config.chunk_size).min(send_limit);
         stream.write_all(&body[sent..chunk_end]).await?;
         sent = chunk_end;
+        if stall && sent >= config.stall_after_bytes && sent < send_limit {
+            stall = false;
+            tokio::time::sleep(config.stall_duration).await;
+        }
         if config.chunk_delay > Duration::ZERO && sent < send_limit {
             tokio::time::sleep(config.chunk_delay).await;
         }

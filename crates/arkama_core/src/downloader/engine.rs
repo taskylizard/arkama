@@ -5,10 +5,12 @@ use super::output::{
 use super::plan::{DownloadPlan, DownloadPlanConfig};
 use super::rate_limit::SpeedLimiter;
 use super::state::{load_state, state_path};
+use super::worker::wait_for_retry;
 use super::{EventSender, send_event};
 use crate::DownloadObservation;
 use crate::http::{self, ClientFactory};
 use crate::observation::Phase;
+use crate::recovery::RetryBudget;
 use crate::{DownloadEvent, DownloadRequest, DownloadSummary};
 use eyre::{Context, Result};
 use std::sync::Arc;
@@ -23,6 +25,7 @@ pub(super) async fn download_inner(
     _keep_controls_alive: watch::Sender<StopSignal>,
     mut stop_rx: watch::Receiver<StopSignal>,
     observation: DownloadObservation,
+    budget: Arc<RetryBudget>,
 ) -> Result<DownloadSummary> {
     let setup = observation.timing(Phase::Setup);
     let DownloadRequest {
@@ -33,11 +36,33 @@ pub(super) async fn download_inner(
         user_agent,
         limit,
         experimental_entropy,
+        recovery,
     } = request;
     let url = Url::parse(&url).context("invalid url")?;
-    let client_factory = ClientFactory::new(user_agent.as_deref(), experimental_entropy)?;
-    let client = client_factory.client()?;
-    let meta = controlled(&mut stop_rx, http::probe(&client, &url)).await?;
+    let mut client_factory = ClientFactory::new(
+        user_agent.as_deref(),
+        experimental_entropy,
+        recovery,
+        budget,
+        &url,
+    )?;
+    let mut attempts = 0;
+    let meta = loop {
+        match controlled(&mut stop_rx, http::probe(&client_factory, &url)).await {
+            Ok(meta) => break meta,
+            Err(error) => {
+                wait_for_retry(
+                    &client_factory,
+                    &mut stop_rx,
+                    &mut attempts,
+                    error,
+                    &observation,
+                )
+                .await?
+            }
+        }
+    };
+    client_factory.origin = Url::parse(&meta.final_url)?.origin().ascii_serialization();
     send_event(
         &events,
         DownloadEvent::Metadata {

@@ -1,5 +1,6 @@
 //! Fixed-cost transfer measurements and an optional dedicated diagnostic collector.
 
+use crate::recovery::RecoveryReason;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -38,6 +39,9 @@ struct Counters {
     disk_written: AtomicU64,
     crash_safe: AtomicU64,
     retries: AtomicU64,
+    recovery_reason: AtomicU64,
+    retry_delay_ms: AtomicU64,
+    network_stalls: AtomicU64,
     active_workers: AtomicU64,
     pending_bytes: AtomicU64,
     dropped: AtomicU64,
@@ -65,6 +69,10 @@ pub struct ObservationSnapshot {
     /// Coverage in the last durably published checkpoint; zero without persisted state.
     pub crash_safe_bytes: u64,
     pub retries: u64,
+    /// Most recent recovery reason, retained after completion. No source or credential data.
+    pub last_recovery_reason: Option<&'static str>,
+    pub last_retry_delay_ms: u64,
+    pub network_stalls: u64,
     pub active_workers: u64,
     /// Body bytes currently waiting for limiting or disk writes, not total process buffers.
     pub pending_bytes: u64,
@@ -85,6 +93,9 @@ impl DownloadObservation {
             disk_written: AtomicU64::new(0),
             crash_safe: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            recovery_reason: AtomicU64::new(0),
+            retry_delay_ms: AtomicU64::new(0),
+            network_stalls: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             pending_bytes: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -104,6 +115,9 @@ impl DownloadObservation {
             disk_written_bytes: load(&self.0.disk_written),
             crash_safe_bytes: load(&self.0.crash_safe),
             retries: load(&self.0.retries),
+            last_recovery_reason: RecoveryReason::label(load(&self.0.recovery_reason)),
+            last_retry_delay_ms: load(&self.0.retry_delay_ms),
+            network_stalls: load(&self.0.network_stalls),
             active_workers: load(&self.0.active_workers),
             pending_bytes: load(&self.0.pending_bytes),
             dropped_events: load(&self.0.dropped),
@@ -131,8 +145,17 @@ impl DownloadObservation {
     pub(crate) fn checkpoint(&self, bytes: u64) {
         self.0.crash_safe.store(bytes, Ordering::Relaxed);
     }
-    pub(crate) fn retry(&self) {
+    pub(crate) fn retry(&self, reason: RecoveryReason, delay: Duration) {
         self.0.retries.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .recovery_reason
+            .store(reason as u64, Ordering::Relaxed);
+        self.0
+            .retry_delay_ms
+            .store(millis(delay), Ordering::Relaxed);
+        if matches!(reason, RecoveryReason::ReadIdle) {
+            self.0.network_stalls.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub(crate) fn dropped(&self) {
         self.0.dropped.fetch_add(1, Ordering::Relaxed);

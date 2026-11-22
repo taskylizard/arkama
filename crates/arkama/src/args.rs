@@ -3,6 +3,13 @@
 use clap::Args;
 use std::path::PathBuf;
 
+fn parse_recovery(src: &str) -> Result<arkama_core::RecoveryPolicy, String> {
+    let policy: arkama_core::RecoveryPolicy =
+        serde_json::from_str(src).map_err(|error| error.to_string())?;
+    policy.validate().map_err(|error| error.to_string())?;
+    Ok(policy)
+}
+
 fn parse_rate(src: &str) -> Result<u64, String> {
     let Ok(bytes) = bytefmt::parse(src) else {
         return Err("invalid byte size".to_string());
@@ -46,6 +53,10 @@ pub struct DownloadArgs {
         help = "Global download speed limit (defaults to config if unset; ex: 2MB, 500KB)."
     )]
     pub limit: Option<u64>,
+
+    #[arg(long = "recovery-policy", value_name = "JSON", value_parser = parse_recovery,
+        help = "Override network deadlines and retries; omitted JSON fields use defaults.")]
+    pub recovery: Option<arkama_core::RecoveryPolicy>,
 
     #[arg(
         long = "experimental-entropy",
