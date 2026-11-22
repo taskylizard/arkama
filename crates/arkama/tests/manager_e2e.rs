@@ -6,7 +6,6 @@ use std::time::Duration;
 use arkama_core::DownloadRequest;
 use arkama_data::Db;
 use arkama_manager::{Command, JobSnapshot, Manager, Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::runtime::Handle;
@@ -17,21 +16,35 @@ use support::{FlakyServer, FlakyServerConfig};
 
 enum Host {
     Local(Manager),
-    Server { child: Box<Child>, addr: String },
+    Server {
+        child: Box<Child>,
+        addr: String,
+        key: String,
+    },
 }
 
 impl Host {
-    async fn open(dir: &Path, server: bool) -> Self {
+    async fn open(dir: &Path, server: bool, source: &str) -> Self {
+        std::fs::create_dir_all(dir.join("out")).unwrap();
         if !server {
             return Self::Local(
-                Manager::open(dir.join("arkama.sqlite"), Handle::current())
+                Manager::open(dir.join("state/arkama.sqlite"), Handle::current())
                     .await
                     .unwrap(),
             );
         }
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_arkama"))
             .args(["daemon", "run"])
-            .env("ARKAMA_DATA_DIR", dir)
+            .arg("--download-root")
+            .arg(dir.join("out"))
+            .arg("--allow-private-source")
+            .arg(
+                url::Url::parse(source)
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization(),
+            )
+            .env("ARKAMA_DATA_DIR", dir.join("state"))
             .env_remove("ARKAMA_DAEMON_ADDR")
             .kill_on_drop(true)
             .spawn()
@@ -42,7 +55,7 @@ impl Host {
                     child.try_wait().unwrap().is_none(),
                     "daemon exited before ready"
                 );
-                match tokio::fs::read_to_string(dir.join("daemon.addr")).await {
+                match tokio::fs::read_to_string(dir.join("state/daemon.addr")).await {
                     Ok(addr) if TcpStream::connect(&addr).await.is_ok() => break addr,
                     _ => {}
                 }
@@ -54,6 +67,7 @@ impl Host {
         Self::Server {
             child: Box::new(child),
             addr,
+            key: std::fs::read_to_string(dir.join("state/credentials/api.key")).unwrap(),
         }
     }
 
@@ -63,9 +77,13 @@ impl Host {
                 .execute(command)
                 .await
                 .map_err(|error| error.to_string()),
-            Self::Server { addr, .. } => {
-                let response =
-                    exchange(addr, serde_json::json!({"Manage": {"command": command}})).await;
+            Self::Server { addr, key, .. } => {
+                let response = exchange(
+                    addr,
+                    key,
+                    serde_json::json!({"Manage": {"command": command}}),
+                )
+                .await;
                 if let Some(error) = response.get("Error") {
                     return Err(error.to_string());
                 }
@@ -77,9 +95,9 @@ impl Host {
     async fn stop(&mut self) {
         match self {
             Self::Local(manager) => manager.shutdown().await.unwrap(),
-            Self::Server { child, addr } => {
+            Self::Server { child, addr, key } => {
                 assert_eq!(
-                    exchange(addr, serde_json::json!("Shutdown")).await,
+                    exchange(addr, key, serde_json::json!("Shutdown")).await,
                     "ShuttingDown"
                 );
                 assert!(
@@ -121,7 +139,8 @@ impl Host {
                     "{}",
                     job.record.error_message.unwrap_or_default()
                 );
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // Normal observation stays below the HTTP connection admission rate.
+                tokio::time::sleep(Duration::from_millis(40)).await;
             }
         })
         .await
@@ -129,15 +148,22 @@ impl Host {
     }
 }
 
-async fn exchange(addr: &str, value: serde_json::Value) -> serde_json::Value {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(format!("{value}\n").as_bytes())
+async fn exchange(addr: &str, key: &str, value: serde_json::Value) -> serde_json::Value {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{addr}/v1/legacy"))
+        .bearer_auth(key)
+        .json(&value)
+        .send()
         .await
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await.unwrap();
-    serde_json::from_str(&line).unwrap()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 fn partial(path: &Path) -> PathBuf {
@@ -156,7 +182,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
     for server in [false, true] {
         source.configure(config.clone());
         let dir = tempfile::tempdir().unwrap();
-        let mut host = Host::open(dir.path(), server).await;
+        let mut host = Host::open(dir.path(), server, &source.url()).await;
         host.execute(Command::SetSetting {
             key: "max_concurrent".into(),
             value: "1".into(),
@@ -171,7 +197,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
             .await
             .is_err()
         );
-        let path = dir.path().join("complete.bin");
+        let path = dir.path().join("out/complete.bin");
         let request = DownloadRequest::new(source.url())
             .output(&path)
             .connections(2);
@@ -200,8 +226,8 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
             .is_err(),
             "paused output lost reservation"
         );
-        let alias = dir.path().join("COMPLETE.bin");
-        let alias_lock = dir.path().join("COMPLETE.bin.arkama.lock");
+        let alias = dir.path().join("out/COMPLETE.bin");
+        let alias_lock = dir.path().join("out/COMPLETE.bin.arkama.lock");
         let case_insensitive = alias_lock.exists();
         if case_insensitive {
             assert!(
@@ -214,7 +240,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
             );
         }
         host.stop().await;
-        host = Host::open(dir.path(), server).await;
+        host = Host::open(dir.path(), server, &source.url()).await;
         assert_eq!(host.job(id).await.record.status, "paused");
         host.execute(Command::Resume { id }).await.unwrap();
         let finished = host.wait(id, |job| job.record.status == "finished").await;
@@ -223,7 +249,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
         assert!(host.execute(Command::Cancel { id }).await.is_err());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), data);
 
-        let second_path = dir.path().join("retry.bin");
+        let second_path = dir.path().join("out/retry.bin");
         let second = host
             .enqueue(
                 DownloadRequest::new(source.url())
@@ -237,7 +263,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
         let cancel_blocker = host
             .enqueue(
                 DownloadRequest::new(source.url())
-                    .output(dir.path().join("cancel-blocker.bin"))
+                    .output(dir.path().join("out/cancel-blocker.bin"))
                     .connections(1),
             )
             .await;
@@ -254,7 +280,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
         host.execute(Command::Cancel { id: cancel_blocker })
             .await
             .unwrap();
-        assert!(!partial(&dir.path().join("cancel-blocker.bin")).exists());
+        assert!(!partial(&dir.path().join("out/cancel-blocker.bin")).exists());
         host.execute(Command::Retry { id: second }).await.unwrap();
         host.wait(second, |job| job.record.status == "finished")
             .await;
@@ -263,14 +289,14 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
         let blocker = host
             .enqueue(
                 DownloadRequest::new(source.url())
-                    .output(dir.path().join("blocker.bin"))
+                    .output(dir.path().join("out/blocker.bin"))
                     .connections(1),
             )
             .await;
         host.wait(blocker, |job| job.record.downloaded_bytes > 8192)
             .await;
         let queued = host
-            .enqueue(DownloadRequest::new(source.url()).output(dir.path().join("queued.bin")))
+            .enqueue(DownloadRequest::new(source.url()).output(dir.path().join("out/queued.bin")))
             .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         host.execute(Command::Pause { id: queued }).await.unwrap();
@@ -289,7 +315,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
         assert_eq!(jobs.len(), 1);
         assert!(has_more, "search ignored pagination");
         host.stop().await;
-        host = Host::open(dir.path(), server).await;
+        host = Host::open(dir.path(), server, &source.url()).await;
         assert_eq!(host.job(queued).await.record.status, "paused");
         host.execute(Command::Cancel { id: blocker }).await.unwrap();
         host.execute(Command::Cancel { id: queued }).await.unwrap();
@@ -297,7 +323,7 @@ async fn shared_controls_preserve_bytes_ownership_and_restart_state() {
         let mut full_stream = FlakyServerConfig::new(data.clone());
         full_stream.accept_ranges = false;
         source.configure(full_stream);
-        let stream_path = dir.path().join("full.bin");
+        let stream_path = dir.path().join("out/full.bin");
         let stream_id = host
             .enqueue(DownloadRequest::new(source.url()).output(&stream_path))
             .await;
@@ -363,8 +389,8 @@ async fn abrupt_daemon_restart_reuses_only_verified_checkpoint_bytes() {
     config.chunk_delay = Duration::from_millis(8);
     let source = FlakyServer::spawn(config).await;
     let dir = tempfile::tempdir().unwrap();
-    let mut host = Host::open(dir.path(), true).await;
-    let path = dir.path().join("crash.bin");
+    let mut host = Host::open(dir.path(), true, &source.url()).await;
+    let path = dir.path().join("out/crash.bin");
     let id = host
         .enqueue(
             DownloadRequest::new(source.url())
@@ -382,10 +408,10 @@ async fn abrupt_daemon_restart_reuses_only_verified_checkpoint_bytes() {
         unreachable!()
     };
     child.kill().await.unwrap();
-    tokio::fs::remove_file(dir.path().join("daemon.addr"))
+    tokio::fs::remove_file(dir.path().join("state/daemon.addr"))
         .await
         .unwrap();
-    host = Host::open(dir.path(), true).await;
+    host = Host::open(dir.path(), true, &source.url()).await;
     host.wait(id, |job| job.record.status == "finished").await;
     assert_eq!(tokio::fs::read(path).await.unwrap(), data);
     host.stop().await;
@@ -405,7 +431,7 @@ async fn shutdown_reports_failed_persistence_and_releases_joined_workers() {
     config.stall_duration = Duration::from_secs(60);
     let source = FlakyServer::spawn(config.clone()).await;
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("arkama.sqlite");
+    let db_path = dir.path().join("state/arkama.sqlite");
     let path = dir.path().join("persist.bin");
     let manager = Manager::open(&db_path, Handle::current()).await.unwrap();
     let host = Host::Local(manager.clone());
@@ -436,7 +462,7 @@ async fn shutdown_reports_failed_persistence_and_releases_joined_workers() {
     drop(connection);
     config.stall_gets = 0;
     source.configure(config);
-    let mut reopened = Host::open(dir.path(), false).await;
+    let mut reopened = Host::open(dir.path(), false, &source.url()).await;
     reopened
         .wait(id, |job| job.record.status == "finished")
         .await;

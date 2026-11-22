@@ -4,12 +4,12 @@
 
 A download manager written in Rust, with a reusable HTTP engine, a CLI, and a local background daemon.
 
-[CLI guide](docs/cli.md) · [Rust API](crates/arkama_core/README.md) · [Development](docs/development.md)
+[CLI guide](docs/cli.md) · [Rust API](crates/arkama_core/README.md) · [Server API](docs/server.md) · [Development](docs/development.md)
 
 > [!WARNING]
 > Arkama is in early development. The reliable core milestone has landed, but the full core/server
-> foundation is not complete. The current daemon has no authentication; keep it local and do not
-> expose it to the internet. A release license has not been added yet.
+> foundation is not complete. Server API keys are enabled by default; remote authenticated access
+> requires an owner-configured TLS proxy. A release license has not been added yet.
 
 ## Getting started
 
@@ -43,7 +43,7 @@ or `arkama-cli download --help` for download options.
 - A persistent manager shared by the local daemon and explicit embedded/no-server use, with joined
   controls, output reservations, live settings, and bounded paginated history.
 
-The daemon is an existing local tool, not the secure client-facing server planned for the foundation.
+The daemon exposes a bounded [single-owner HTTP/JSON API](docs/server.md), with safe local defaults.
 The experimental connection-entropy option is opt-in for bonded LACP/ECMP setups, not a general
 flaky-link optimization. See the [CLI guide](docs/cli.md).
 
@@ -87,13 +87,12 @@ documentation, and feature/MSRV checks.
 
 ## Next milestones
 
-The reliability/safe-core API, bounded observations, configurable recovery, and shared-manager
-milestones are implemented. See the [manager contract](crates/arkama_manager/README.md).
+The reliability/safe-core API, bounded observations, configurable recovery, shared-manager, and
+secure-server milestones are implemented. See the [manager contract](crates/arkama_manager/README.md).
 Optional diagnostics use a dedicated OS thread; slow observers cannot back up the transfer path.
 
 The remaining foundation work is:
 
-5. A secure single-owner server and bounded, reconnectable client API.
 6. Named queues, shared limits, folder rules, and scheduled download windows.
 7. Credential-safe browser request context and duplicate-safe client handoff.
 8. Combined cross-platform, fault, security, and performance validation for a foundation release.

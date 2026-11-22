@@ -7,6 +7,7 @@ use arkama_data::DownloadRecord;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) enum DaemonRequest {
     Ping,
     Shutdown,
@@ -33,6 +34,7 @@ pub(super) enum DaemonResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct QueuedDownloadRequest {
     url: String,
     output: Option<PathBuf>,

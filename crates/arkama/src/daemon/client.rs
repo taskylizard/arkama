@@ -3,8 +3,6 @@
 use arkama_core::DownloadRequest;
 use arkama_data::DownloadRecord;
 use eyre::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 use super::protocol::{DaemonRequest, DaemonResponse, DaemonStatus};
 use super::read_daemon_addr;
@@ -87,24 +85,34 @@ pub(super) async fn send_request(request: DaemonRequest) -> Result<DaemonRespons
 
 async fn send_inner(request: DaemonRequest) -> Result<DaemonResponse> {
     let daemon_addr = read_daemon_addr()?;
-    let stream = TcpStream::connect(daemon_addr)
-        .await
-        .with_context(|| format!("failed to connect to daemon at {daemon_addr}"))?;
-    let (read_half, mut write_half) = stream.into_split();
-    let request = serde_json::to_vec(&request).context("failed to serialize daemon request")?;
-    write_half
-        .write_all(&request)
-        .await
-        .context("failed to write daemon request")?;
-    write_half
-        .write_all(b"\n")
-        .await
-        .context("failed to finish daemon request")?;
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read daemon response")?;
-    serde_json::from_str(&line).context("invalid daemon response")
+    if !daemon_addr.ip().is_loopback() {
+        return Err(eyre::eyre!(
+            "local CLI discovery must refer to a loopback HTTP API"
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut request = client
+        .post(format!("http://{daemon_addr}/v1/legacy"))
+        .json(&request);
+    if let Ok(key) = super::auth::read_key() {
+        request = request.bearer_auth(key);
+    }
+    let mut response = request.send().await.context("daemon HTTP request failed")?;
+    if !response.status().is_success() {
+        return Err(eyre::eyre!(
+            "daemon HTTP request refused ({})",
+            response.status()
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err(eyre::eyre!("daemon reply exceeds limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).context("invalid daemon response")
 }

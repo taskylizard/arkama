@@ -37,6 +37,7 @@ pub fn discard_partial(output: &std::path::Path) -> Result<()> {
 #[derive(Clone, Default)]
 pub struct DownloadSession {
     budget: Arc<RetryBudget>,
+    destination: crate::DestinationPolicy,
 }
 
 /// Starts a download on a background task.
@@ -89,6 +90,12 @@ pub fn start_download_with_handle(
 }
 
 impl DownloadSession {
+    /// Applies host-owned destination restrictions to every request, redirect, and DNS lookup.
+    pub fn destination_policy(mut self, policy: crate::DestinationPolicy) -> Self {
+        self.destination = policy;
+        self
+    }
+
     /// Starts a download on the current Tokio runtime, sharing this session's retry budgets.
     pub fn start(&self, request: DownloadRequest) -> Result<DownloadHandle> {
         let handle = Handle::try_current()
@@ -103,7 +110,12 @@ impl DownloadSession {
         request: DownloadRequest,
     ) -> Result<DownloadHandle> {
         request.recovery.validate()?;
+        let url = url::Url::parse(&request.url).map_err(|_| Error::InvalidUrl {
+            message: "invalid URL".into(),
+        })?;
+        self.destination.validate(&url)?;
         let budget = self.budget.clone();
+        let destination = self.destination.clone();
         let (tx, rx) = mpsc::channel(8);
         let observation = DownloadObservation::new();
         let task_observation = observation.clone();
@@ -117,6 +129,7 @@ impl DownloadSession {
                 stop_rx,
                 task_observation.clone(),
                 budget,
+                destination,
             )
             .await
             .map_err(map_download_error);
@@ -165,6 +178,7 @@ pub async fn download(request: DownloadRequest) -> Result<DownloadSummary> {
         stop_rx,
         DownloadObservation::new(),
         Arc::new(RetryBudget::default()),
+        crate::DestinationPolicy::default(),
     )
     .await
     .map_err(map_download_error)

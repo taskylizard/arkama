@@ -107,11 +107,13 @@ dependencies = [
  "clap_complete_nushell",
  "comfy-table",
  "eyre",
+ "getrandom 0.3.4",
  "http-body-util",
  "hyper",
  "hyper-util",
  "indicatif",
  "owo-colors",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -119,6 +121,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

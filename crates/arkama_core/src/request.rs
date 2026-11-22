@@ -29,6 +29,7 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 /// # Ok(()) }
 /// ```
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Debug)]
 pub struct DownloadRequest {
     pub url: String,

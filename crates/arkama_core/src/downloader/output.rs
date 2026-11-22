@@ -78,7 +78,8 @@ pub(crate) fn lock_output(output: &Path) -> Result<fs::File> {
     let name = output
         .file_name()
         .ok_or_else(|| eyre::eyre!("output file name missing"))?
-        .to_string_lossy();
+        .to_string_lossy()
+        .to_ascii_lowercase();
     if [".arkama.part", ".arkama.state", ".arkama.lock"]
         .iter()
         .any(|suffix| name.ends_with(suffix))

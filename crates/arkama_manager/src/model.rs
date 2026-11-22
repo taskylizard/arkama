@@ -18,6 +18,9 @@ pub enum Command {
     Show {
         id: i64,
     },
+    Diagnostics {
+        id: i64,
+    },
     Pause {
         id: i64,
     },
@@ -93,6 +96,10 @@ pub enum Response {
         revision: u64,
     },
     Job(Box<JobSnapshot>),
+    Diagnostics {
+        id: i64,
+        snapshot: Option<Box<arkama_core::DiagnosticsSnapshot>>,
+    },
     Setting {
         key: String,
         value: Option<String>,

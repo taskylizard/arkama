@@ -17,7 +17,7 @@ use arkama_data::{Db, default_download_dir};
 use fs2::FileExt;
 use tokio::runtime::Handle;
 
-use crate::{Command, Error, JobSnapshot, Message, Reply, Response, Result, Status};
+use crate::{Command, Error, JobSnapshot, ManagerPolicy, Message, Reply, Response, Result, Status};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Intent {
@@ -34,12 +34,14 @@ struct Active {
     pending: Vec<(Intent, Reply)>,
     metadata_saved: bool,
     last_save: Instant,
+    diagnostics: Option<arkama_core::Diagnostics>,
 }
 
 pub(crate) struct Actor {
     _ownership: File,
     runtime: Handle,
     session: DownloadSession,
+    policy: ManagerPolicy,
     db: Db,
     active: BTreeMap<i64, Active>,
     max_concurrent: usize,
@@ -48,7 +50,7 @@ pub(crate) struct Actor {
 }
 
 impl Actor {
-    pub(crate) fn open(path: PathBuf, runtime: Handle) -> Result<Self> {
+    pub(crate) fn open(path: PathBuf, runtime: Handle, policy: ManagerPolicy) -> Result<Self> {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -63,6 +65,17 @@ impl Actor {
                 .map(|parent| parent.join(path.file_name().unwrap_or_default()))
         }
         .map_err(|_| Error::new("storage", "cannot resolve store path"))?;
+        let store = path.parent().expect("resolved store parent");
+        if policy
+            .roots
+            .iter()
+            .any(|root| root.starts_with(store) || store.starts_with(root))
+        {
+            return Err(Error::new(
+                "invalid",
+                "store and output roots must be disjoint",
+            ));
+        }
         let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
         lock_name.push(".manager.lock");
         let lock_path = path.with_file_name(lock_name);
@@ -91,7 +104,8 @@ impl Actor {
         Ok(Self {
             _ownership: ownership,
             runtime,
-            session: DownloadSession::default(),
+            session: DownloadSession::default().destination_policy(policy.destination.clone()),
+            policy,
             db,
             active: BTreeMap::new(),
             max_concurrent: max_concurrent.parse().expect("validated limit"),
@@ -194,6 +208,12 @@ impl Actor {
             })),
             Command::Enqueue { mut request } => {
                 validate_request(&request)?;
+                self.policy
+                    .destination
+                    .validate(&url::Url::parse(&request.url).expect("validated URL"))
+                    .map_err(|_| {
+                        Error::new("forbidden", "download destination is not authorized")
+                    })?;
                 self.resolve_output(&mut request, -1)?;
                 let id = self.db.insert_daemon_download(&request)?;
                 self.revision += 1;
@@ -222,6 +242,36 @@ impl Actor {
                 })
             }
             Command::Show { id } => Ok(Response::Job(Box::new(self.job(id)?))),
+            Command::Diagnostics { id } => {
+                self.job(id)?;
+                let snapshot = if let Some(active) = self.active.get_mut(&id) {
+                    if active.diagnostics.is_none() {
+                        active.diagnostics = arkama_core::Diagnostics::start(
+                            active.observation.clone(),
+                            arkama_core::DiagnosticsConfig {
+                                disk_path: active.request.output.as_ref().map(|output| {
+                                    let mut path = output.as_os_str().to_os_string();
+                                    path.push(".arkama.part");
+                                    PathBuf::from(path)
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .ok();
+                    }
+                    active.diagnostics.as_ref().map(|diagnostics| {
+                        let mut snapshot = diagnostics.snapshot();
+                        snapshot.observation = active.observation.snapshot();
+                        snapshot
+                    })
+                } else {
+                    self.db.load_diagnostics(id)?
+                };
+                Ok(Response::Diagnostics {
+                    id,
+                    snapshot: snapshot.map(Box::new),
+                })
+            }
             Command::Pause { id } => {
                 self.require_status(id, &["queued", "paused"])?;
                 self.db.transition_download(id, "paused")?;
@@ -235,6 +285,11 @@ impl Actor {
                 if retained && status != "cancelled" {
                     if let Some(request) = self.db.load_daemon_request(id)? {
                         if let Some(output) = request.output {
+                            self.policy.directory(
+                                output
+                                    .parent()
+                                    .ok_or_else(|| Error::new("invalid", "output has no parent"))?,
+                            )?;
                             arkama_core::discard_partial(&output).map_err(|_| {
                                 Error::new("conflict", "partial output cannot be safely discarded")
                             })?;
@@ -259,6 +314,9 @@ impl Actor {
             }
             Command::SetSetting { key, value } => {
                 validate_setting(&key, &value)?;
+                if key == "download_dir" {
+                    self.policy.directory(Path::new(&value))?;
+                }
                 self.db.set_setting(&key, &value)?;
                 if key == "max_concurrent" {
                     self.max_concurrent = value.parse().expect("validated limit");
@@ -363,6 +421,7 @@ impl Actor {
                     .output_dir
                     .clone()
                     .or(self.db.get_setting("download_dir")?.map(PathBuf::from))
+                    .or_else(|| self.policy.roots.first().cloned())
                     .unwrap_or_else(default_download_dir);
                 dir.join(name)
             }
@@ -371,11 +430,13 @@ impl Actor {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| Error::new("invalid", "output filename must be UTF-8"))?;
+        crate::policy::validate_filename(filename)?;
         let parent = output
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent)
+        let parent = self.policy.directory(parent)?;
+        std::fs::create_dir_all(&parent)
             .map_err(|_| Error::new("storage", "cannot create output directory"))?;
         let output = parent
             .canonicalize()
@@ -443,6 +504,7 @@ impl Actor {
                             pending: Vec::new(),
                             metadata_saved: false,
                             last_save: Instant::now(),
+                            diagnostics: None,
                         },
                     );
                 }
@@ -504,6 +566,9 @@ impl Actor {
                         snapshot.written_bytes,
                     )?;
                     let _ = self.db.save_observation(id, &snapshot);
+                    if let Some(diagnostics) = &active.diagnostics {
+                        let _ = self.db.save_diagnostics(id, &diagnostics.snapshot());
+                    }
                     active.last_save = Instant::now();
                     self.revision += 1;
                 }
@@ -527,6 +592,11 @@ impl Actor {
             let active = self.active.remove(&id).expect("joined active job");
             let snapshot = active.observation.snapshot();
             let _ = self.db.save_observation(id, &snapshot);
+            if let Some(diagnostics) = &active.diagnostics {
+                let mut diagnostics = diagnostics.snapshot();
+                diagnostics.observation = snapshot.clone();
+                let _ = self.db.save_diagnostics(id, &diagnostics);
+            }
             let persisted: eyre::Result<()> = (|| {
                 self.db.update_download_progress(
                     id,

@@ -95,6 +95,10 @@ impl Db {
             self.conn
                 .execute("ALTER TABLE downloads ADD COLUMN observation_json TEXT", [])?;
         }
+        if !self.downloads_column_exists("diagnostics_json")? {
+            self.conn
+                .execute("ALTER TABLE downloads ADD COLUMN diagnostics_json TEXT", [])?;
+        }
         if !self.downloads_column_exists("attempt_started")? {
             self.conn.execute(
                 "ALTER TABLE downloads ADD COLUMN attempt_started INTEGER NOT NULL DEFAULT 0",

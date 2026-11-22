@@ -8,6 +8,7 @@
 
 mod actor;
 mod model;
+mod policy;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -20,6 +21,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{oneshot, watch};
 
 pub use model::{Command, JobSnapshot, Response, Status};
+pub use policy::ManagerPolicy;
 
 /// Stable error categories for local and transport consumers. Messages never contain requests.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -75,6 +77,15 @@ impl Manager {
     /// Opens a store on the manager thread. A retained cross-process lock refuses a second host.
     /// Do not mutate this store directly while a manager owns it.
     pub async fn open(path: impl Into<PathBuf>, runtime: Handle) -> Result<Self> {
+        Self::open_with_policy(path, runtime, ManagerPolicy::default()).await
+    }
+
+    /// Opens with immutable owner-selected boundaries. Requests and settings cannot relax them.
+    pub async fn open_with_policy(
+        path: impl Into<PathBuf>,
+        runtime: Handle,
+        policy: ManagerPolicy,
+    ) -> Result<Self> {
         let path = path.into();
         let (sender, receiver) = mpsc::sync_channel(128);
         let stop = Arc::new(AtomicBool::new(false));
@@ -84,7 +95,7 @@ impl Manager {
         std::thread::Builder::new()
             .name("arkama-manager".into())
             .spawn(move || {
-                let result = match actor::Actor::open(path, runtime) {
+                let result = match actor::Actor::open(path, runtime, policy) {
                     Ok(mut actor) => {
                         let _ = ready_tx.send(Ok(()));
                         actor.run(receiver, thread_stop)

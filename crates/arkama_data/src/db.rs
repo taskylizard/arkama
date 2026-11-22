@@ -514,6 +514,31 @@ impl Db {
             .flatten();
         Ok(serialized.and_then(|snapshot| serde_json::from_str(&snapshot).ok()))
     }
+
+    pub fn save_diagnostics(
+        &self,
+        id: i64,
+        snapshot: &arkama_core::DiagnosticsSnapshot,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads SET diagnostics_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(snapshot)?, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_diagnostics(&self, id: i64) -> Result<Option<arkama_core::DiagnosticsSnapshot>> {
+        let serialized: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT diagnostics_json FROM downloads WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(serialized.and_then(|snapshot| serde_json::from_str(&snapshot).ok()))
+    }
 }
 
 const DOWNLOAD_RECORD_SELECT: &str = "SELECT id, url, output_path, status, error_message, queue_name, priority, total_bytes, downloaded_bytes, started_at, finished_at, created_at, updated_at, queue_wait_ms, paused_ms, state_since_ms FROM downloads";

@@ -260,7 +260,7 @@ impl Default for DiagnosticsConfig {
 }
 
 /// Unsmooth interval speed; gaps and coverage resets have no speed estimate.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub struct SpeedSample {
     pub elapsed_ms: u64,
@@ -269,7 +269,7 @@ pub struct SpeedSample {
 }
 
 /// OS measurements are process-wide, not attributed to a particular job.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsSnapshot {
     pub observation: ObservationSnapshot,

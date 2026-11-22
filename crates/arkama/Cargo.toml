@@ -28,6 +28,13 @@ clap_complete = "4.5"
 clap_complete_nushell = "4.5"
 comfy-table = "7.2.2"
 owo-colors = "4"
+getrandom = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest.workspace = true
+tempfile = "3"
+url.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"

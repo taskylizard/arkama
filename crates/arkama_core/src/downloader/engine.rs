@@ -26,6 +26,7 @@ pub(super) async fn download_inner(
     mut stop_rx: watch::Receiver<StopSignal>,
     observation: DownloadObservation,
     budget: Arc<RetryBudget>,
+    destination: crate::DestinationPolicy,
 ) -> Result<DownloadSummary> {
     let setup = observation.timing(Phase::Setup);
     let DownloadRequest {
@@ -45,6 +46,7 @@ pub(super) async fn download_inner(
         recovery,
         budget,
         &url,
+        destination,
     )?;
     let mut attempts = 0;
     let meta = loop {

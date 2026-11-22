@@ -70,5 +70,9 @@ Settings `max_concurrent` and `connections` accept 1–64; `download_dir` is a n
 live without preempting workers. The legacy standalone CLI settings remain an offline store editor;
 use `manage` for live shared settings. Named queues and shared host/bandwidth limits follow separately.
 
-The current daemon transport is local and unauthenticated. The secure/versioned HTTP contract is
-the next milestone, not a guarantee supplied by this crate's local command handle.
+Server hosts use `Manager::open_with_policy` with immutable authorized roots and destination policy.
+Client requests and live settings cannot weaken those boundaries. Trusted local/embedded hosts may
+use unrestricted `Manager::open`. `Diagnostics { id }` starts optional collection for an active
+attempt, with 500 ms sampling and 120 retained samples; inactive jobs return the last persisted
+export or null. Optional collection/persistence failure does not fail downloads. The host's
+authenticated [HTTP/JSON v1 API](../../docs/server.md) exposes this same manager.

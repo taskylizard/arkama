@@ -3,23 +3,19 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
 use arkama_data::{daemon_addr_path, daemon_log_path, db_path};
-use arkama_manager::{Command, Manager, Response};
-use clap::Subcommand;
+use arkama_manager::{Command, Manager, ManagerPolicy, Response};
+use clap::{Args, Subcommand};
 use eyre::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod auth;
 mod client;
 mod protocol;
+mod server;
 
 pub(crate) use client::{
     cancel_job, enqueue_download, list_jobs, manager_command, pause_job, resume_job, retry_job,
@@ -28,12 +24,52 @@ pub(crate) use client::{
 use client::{send_request, status};
 use protocol::{DaemonRequest, DaemonResponse, DaemonStatus};
 
+#[derive(Args, Debug, Default)]
+pub struct ServerOptions {
+    #[arg(
+        long,
+        help = "Explicitly disable API keys; reachable callers can control downloads."
+    )]
+    no_auth: bool,
+    #[arg(
+        long,
+        requires = "no_auth",
+        help = "Allow non-loopback credential-free binding."
+    )]
+    allow_remote_no_auth: bool,
+    #[arg(
+        long = "download-root",
+        help = "Authorized output root (repeatable); defaults to Downloads."
+    )]
+    roots: Vec<PathBuf>,
+    #[arg(
+        long = "allow-private-source",
+        help = "Exact owner-authorized private HTTP origin (repeatable)."
+    )]
+    private_origins: Vec<String>,
+    #[arg(
+        long = "allow-origin",
+        help = "Exact HTTPS browser/TLS-proxy origin (repeatable)."
+    )]
+    origins: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KeyCommand {
+    #[command(about = "Replace the owner key; existing keys stop working immediately.")]
+    Rotate,
+    #[command(about = "Revoke the owner key until explicitly rotated.")]
+    Revoke,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
     #[command(about = "Run the download host in the foreground.")]
     Run {
         #[arg(long, help = "Run the shared manager without a control listener.")]
         no_server: bool,
+        #[command(flatten)]
+        server: ServerOptions,
     },
     #[command(about = "Start the daemon in the background.")]
     Start,
@@ -41,6 +77,11 @@ pub enum DaemonCommand {
     Status,
     #[command(about = "Ask the daemon to stop and join its downloads.")]
     Stop,
+    #[command(about = "Rotate or revoke the locally stored API key.")]
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
 }
 
 struct AddrFileGuard {
@@ -54,10 +95,19 @@ impl Drop for AddrFileGuard {
 
 pub async fn run(command: DaemonCommand) -> Result<()> {
     match command {
-        DaemonCommand::Run { no_server } => run_foreground(no_server).await,
+        DaemonCommand::Run { no_server, server } => run_foreground(no_server, server).await,
         DaemonCommand::Start => start_background().await,
         DaemonCommand::Status => status_command().await,
         DaemonCommand::Stop => stop_command().await,
+        DaemonCommand::Key { command } => {
+            let value = match command {
+                KeyCommand::Rotate => auth::random_id()?,
+                KeyCommand::Revoke => "revoked".into(),
+            };
+            auth::write_key(&value)?;
+            println!("credential updated at {}", auth::key_path()?.display());
+            Ok(())
+        }
     }
 }
 
@@ -78,9 +128,21 @@ fn init_tracing() -> Result<()> {
     Ok(())
 }
 
-async fn run_foreground(no_server: bool) -> Result<()> {
+async fn run_foreground(no_server: bool, mut options: ServerOptions) -> Result<()> {
+    auth::protect_directory(&arkama_data::data_dir()?)?;
     init_tracing()?;
-    let manager = Manager::open(db_path()?, Handle::current()).await?;
+    let policy = if no_server {
+        ManagerPolicy::default()
+    } else {
+        if options.roots.is_empty() {
+            options.roots.push(arkama_data::default_download_dir());
+        }
+        for root in &options.roots {
+            std::fs::create_dir_all(root)?;
+        }
+        ManagerPolicy::restricted(options.roots.clone(), &options.private_origins)?
+    };
+    let manager = Manager::open_with_policy(db_path()?, Handle::current(), policy).await?;
     if no_server {
         tokio::select! {
             _ = manager.closed() => {}
@@ -88,67 +150,9 @@ async fn run_foreground(no_server: bool) -> Result<()> {
         }
         return manager.shutdown().await.map_err(Into::into);
     }
-    let result = serve(manager.clone()).await;
+    let result = server::serve(manager.clone(), options).await;
     manager.shutdown().await?;
     result
-}
-
-async fn serve(manager: Manager) -> Result<()> {
-    let bind_addr = daemon_bind_addr()?;
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .context("failed to bind daemon listener")?;
-    let listen_addr = listener.local_addr()?;
-    let addr_path = daemon_addr_path()?;
-    write_daemon_addr(&addr_path, listen_addr)?;
-    let _guard = AddrFileGuard { path: addr_path };
-    let slots = Arc::new(Semaphore::new(32));
-    let mut connections = JoinSet::new();
-    info!("daemon listening on {listen_addr}");
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let Ok(slot) = slots.clone().try_acquire_owned() else { continue; };
-                let manager = manager.clone();
-                connections.spawn(async move {
-                    let _slot = slot;
-                    let _ = tokio::time::timeout(Duration::from_secs(30), handle_connection(stream, manager)).await;
-                });
-            }
-            _ = connections.join_next(), if !connections.is_empty() => {}
-            _ = manager.closed() => break,
-            signal = tokio::signal::ctrl_c() => { signal?; manager.shutdown().await?; break; }
-        }
-    }
-    drop(listener);
-    // Allow the connection that requested shutdown to deliver its acknowledged reply.
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while connections.join_next().await.is_some() {}
-    })
-    .await;
-    info!("daemon stopped");
-    Ok(())
-}
-
-async fn handle_connection(stream: TcpStream, manager: Manager) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half.take(65_537));
-    let mut line = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\n', &mut line)).await??;
-    if line.len() > 65_536 || line.last() != Some(&b'\n') {
-        return Err(eyre::eyre!("invalid request size or framing"));
-    }
-    let request: DaemonRequest =
-        serde_json::from_slice(&line).map_err(|_| eyre::eyre!("invalid daemon request"))?;
-    let response = adapt_request(&manager, request).await;
-    let response = serde_json::to_vec(&response)?;
-    if response.len() > 2 * 1024 * 1024 {
-        return Err(eyre::eyre!("response exceeds limit"));
-    }
-    write_half.write_all(&response).await?;
-    write_half.write_all(b"\n").await?;
-    Ok(())
 }
 
 async fn adapt_request(manager: &Manager, request: DaemonRequest) -> DaemonResponse {
@@ -271,11 +275,6 @@ fn daemon_bind_addr() -> Result<SocketAddr> {
         }
         Err(error) => Err(error).context("failed to read ARKAMA_DAEMON_ADDR"),
     }?;
-    if !addr.ip().is_loopback() {
-        return Err(eyre::eyre!(
-            "remote binding requires the secure server; this local transport only accepts loopback"
-        ));
-    }
     Ok(addr)
 }
 

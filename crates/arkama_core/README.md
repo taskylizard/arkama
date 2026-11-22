@@ -230,6 +230,26 @@ Observation snapshots expose the latest admitted recovery reason and delay, retr
 read-idle stalls without URL/header/error strings. Final errors and acknowledgements remain available
 through `join`, not optional events. Shared persistent job-state integration follows in the manager.
 
+## Host-selected destination policy
+
+Trusted standalone calls and default `DownloadSession` instances allow local HTTP/HTTPS sources.
+Server hosts select immutable network restrictions on the session, independently of request fields:
+
+```rust
+use arkama_core::{DestinationPolicy, DownloadSession};
+
+let policy = DestinationPolicy::public_only(&[])?;
+let session = DownloadSession::default().destination_policy(policy);
+// session.start(request) validates literal destinations before spawning, and checks DNS/redirects.
+# Ok::<(), arkama_core::Error>(())
+```
+
+Restricted sessions disable environment proxies, pin checked DNS answers, refuse private/special
+addresses and URL credentials, and recheck every redirect. Bounded private-source exceptions are
+exact origins chosen by the host. Direct standalone functions remain unrestricted trusted-local
+use. See the [server boundary contract](../../docs/server.md); network policy is not a filesystem
+sandbox, and fully safe Rust consumers still own runtime/shutdown and output authorization.
+
 ## Feature flags
 
 Default features:

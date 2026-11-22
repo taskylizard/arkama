@@ -53,8 +53,10 @@ impl ClientFactory {
         recovery: RecoveryPolicy,
         budget: Arc<RetryBudget>,
         url: &Url,
+        destination: crate::DestinationPolicy,
     ) -> Result<Self> {
-        let base = build_client(user_agent, experimental_entropy, &recovery)?;
+        destination.validate(url)?;
+        let base = build_client(user_agent, experimental_entropy, &recovery, destination)?;
         Ok(Self {
             base,
             recovery,
@@ -78,6 +80,13 @@ impl ClientFactory {
         attempt: u32,
         error: eyre::Report,
     ) -> Result<(RecoveryReason, Duration)> {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }) {
+            return Err(error);
+        }
         let (reason, server_wait, origin) =
             if let Some(failure) = error.downcast_ref::<HttpFailure>() {
                 let Some(reason) = failure.reason() else {
@@ -209,6 +218,7 @@ fn build_client(
     user_agent: Option<&str>,
     experimental_entropy: bool,
     recovery: &RecoveryPolicy,
+    destination: crate::DestinationPolicy,
 ) -> Result<Client> {
     let user_agent = user_agent.unwrap_or("arkama/0.1");
     let mut headers = HeaderMap::new();
@@ -221,7 +231,17 @@ fn build_client(
         .no_brotli()
         .no_deflate()
         .no_zstd()
-        .redirect(Policy::limited(10));
+        .redirect(Policy::none());
+    builder = destination.configure(builder);
+    builder = builder.redirect(Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("redirect limit exceeded")
+        } else if destination.validate(attempt.url()).is_err() {
+            attempt.error("redirect destination is not allowed")
+        } else {
+            attempt.follow()
+        }
+    }));
     if experimental_entropy {
         builder = builder.pool_max_idle_per_host(0);
         builder = builder.pool_idle_timeout(Duration::from_secs(0));

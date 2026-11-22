@@ -93,8 +93,8 @@ it is not a download-cancel command and does not delete completed files.
 ## Local background jobs
 
 > [!WARNING]
-> The current daemon is unauthenticated and uses line-delimited JSON over TCP. Keep it on loopback.
-> It is not ready for remote exposure or browser-origin access.
+> The HTTP/JSON daemon enables API keys and loopback binding by default. See the
+> [server guide](server.md) before selecting private sources, browser origins or remote access.
 
 ```sh
 arkama-cli daemon start
@@ -136,8 +136,9 @@ Managed jobs reserve output paths at admission and use URL basename inference; d
 still prefer HTTP filenames. Search pagination is bounded through `manage`, including filtered pages.
 
 `ARKAMA_DATA_DIR` overrides the application data directory containing `arkama.sqlite`, `daemon.addr`,
-and `daemon.log`. `ARKAMA_DAEMON_ADDR` overrides the daemon bind/client address. Non-loopback binding
-is refused until the secure server contract is implemented; do not expose this transport through a proxy.
+and `daemon.log`. `ARKAMA_DAEMON_ADDR` overrides the daemon bind/client address. Local CLI discovery
+requires loopback. Authenticated remote access requires an owner-configured local TLS proxy; plain
+authenticated non-loopback binding is refused. See [keys, roots and explicit no-auth](server.md).
 
 ## Shell completions
 

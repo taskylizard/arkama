@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
+mod destination;
 mod downloader;
 mod error;
 mod http;
@@ -10,6 +11,7 @@ mod request;
 mod segment;
 mod task;
 
+pub use destination::DestinationPolicy;
 pub use downloader::{
     DownloadSession, discard_partial, download, start_download, start_download_with_handle,
 };
