@@ -4,7 +4,9 @@ use super::rate_limit::SpeedLimiter;
 use super::state::{DownloadState, update_state};
 use super::{EventSender, send_event};
 use crate::DownloadEvent;
+use crate::DownloadObservation;
 use crate::http::{self, ClientFactory, HttpMeta};
+use crate::observation::Phase;
 use crate::segment::Segment;
 use eyre::{Context, Result};
 use futures_util::StreamExt;
@@ -86,6 +88,7 @@ pub(crate) struct DownloadSegmentContext {
     pub(crate) events: Option<Arc<EventSender>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
     pub(crate) total_size: Option<u64>,
+    pub(crate) observation: DownloadObservation,
 }
 
 #[derive(Clone)]
@@ -98,6 +101,7 @@ pub(crate) struct DownloadSingleContext {
     pub(crate) events: Option<Arc<EventSender>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
     pub(crate) total_size: Option<u64>,
+    pub(crate) observation: DownloadObservation,
 }
 
 pub(crate) async fn download_segment(
@@ -116,7 +120,9 @@ pub(crate) async fn download_segment(
         events,
         total_downloaded,
         total_size,
+        observation,
     } = context;
+    let _worker = observation.worker();
     let Some(mut start) = segment.remaining_start() else {
         return Ok(());
     };
@@ -144,6 +150,8 @@ pub(crate) async fn download_segment(
                 if attempts > 5 {
                     return Err(err);
                 }
+                observation.retry();
+                let _retry = observation.timing(Phase::Retry);
                 let backoff = backoff_delay(attempts);
                 controlled(&mut stop_rx, async {
                     tokio::time::sleep(backoff).await;
@@ -183,16 +191,23 @@ pub(crate) async fn download_segment(
                 next = stream.next() => {
                     match next {
                         Some(Ok(bytes)) => {
+                            observation.received(bytes.len() as u64);
+                            let _pending = observation.pending(bytes.len() as u64);
                             if bytes.len() as u64 > segment.end + 1 - offset {
                                 return Err(eyre::eyre!("range body exceeds requested bounds"));
                             }
                             if let Some(speed_limiter) = speed_limiter.as_ref() {
+                                let _throttle = observation.timing(Phase::Throttle);
                                 controlled(&mut stop_rx, async { speed_limiter.throttle(bytes.len() as u64).await; Ok(()) }).await?;
                             }
-                            file.seek(SeekFrom::Start(offset)).await?;
-                            file.write_all(&bytes).await?;
-                            file.flush().await?;
+                            {
+                                let _disk = observation.timing(Phase::DiskWrite);
+                                file.seek(SeekFrom::Start(offset)).await?;
+                                file.write_all(&bytes).await?;
+                                file.flush().await?;
+                            }
                             let len = bytes.len() as u64;
+                            observation.disk_written(len);
                             offset += len;
                             segment.downloaded += len;
                             // Don't checkpoint complete coverage until the exact response ends.
@@ -232,6 +247,8 @@ pub(crate) async fn download_segment(
                             if attempts > 5 {
                                 return Err(eyre::eyre!("segment download failed: {err}"));
                             }
+                            observation.retry();
+                            let _retry = observation.timing(Phase::Retry);
                             let backoff = backoff_delay(attempts);
                             controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                             start = segment.start + segment.downloaded;
@@ -245,6 +262,8 @@ pub(crate) async fn download_segment(
                                 if attempts > 5 {
                                     return Err(eyre::eyre!("segment ended early"));
                                 }
+                                observation.retry();
+                                let _retry = observation.timing(Phase::Retry);
                                 let backoff = backoff_delay(attempts);
                                 controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                                 start = segment.start + segment.downloaded;
@@ -283,7 +302,9 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
         events,
         total_downloaded,
         total_size,
+        observation,
     } = context;
+    let _worker = observation.worker();
     let mut attempts = 0u32;
     ensure_parent_dir(&output)?;
     loop {
@@ -304,6 +325,8 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                 if attempts > 5 {
                     return Err(err);
                 }
+                observation.retry();
+                let _retry = observation.timing(Phase::Retry);
                 let backoff = backoff_delay(attempts);
                 controlled(&mut stop_rx, async {
                     tokio::time::sleep(backoff).await;
@@ -345,15 +368,22 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                     match next {
                         Some(Ok(bytes)) => {
                             let len = bytes.len() as u64;
+                            observation.received(len);
+                            let _pending = observation.pending(len);
                             if expected.is_some_and(|total| len > total.saturating_sub(offset)) {
                                 return Err(eyre::eyre!("full response exceeds expected length"));
                             }
                             if let Some(speed_limiter) = speed_limiter.as_ref() {
+                                let _throttle = observation.timing(Phase::Throttle);
                                 controlled(&mut stop_rx, async { speed_limiter.throttle(bytes.len() as u64).await; Ok(()) }).await?;
                             }
-                            file.seek(SeekFrom::Start(offset)).await?;
-                            file.write_all(&bytes).await?;
-                            file.flush().await?;
+                            {
+                                let _disk = observation.timing(Phase::DiskWrite);
+                                file.seek(SeekFrom::Start(offset)).await?;
+                                file.write_all(&bytes).await?;
+                                file.flush().await?;
+                            }
+                            observation.disk_written(len);
                             offset += len;
                             let downloaded = total_downloaded.fetch_add(len, Ordering::Relaxed) + len;
                             send_event(
@@ -370,6 +400,8 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                             if attempts > 5 {
                                 return Err(eyre::eyre!("download failed: {err}"));
                             }
+                            observation.retry();
+                            let _retry = observation.timing(Phase::Retry);
                             let backoff = backoff_delay(attempts);
                             controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                             break;
@@ -382,6 +414,8 @@ pub(crate) async fn download_single(context: DownloadSingleContext) -> Result<()
                                     if attempts > 5 {
                                         return Err(eyre::eyre!("download ended early"));
                                     }
+                                    observation.retry();
+                                    let _retry = observation.timing(Phase::Retry);
                                     let backoff = backoff_delay(attempts);
                                     controlled(&mut stop_rx, async { tokio::time::sleep(backoff).await; Ok(()) }).await?;
                                     break;

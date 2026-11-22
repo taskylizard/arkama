@@ -1,6 +1,9 @@
 use super::output::sidecar_path;
 #[cfg(feature = "serde")]
 use super::output::sync_parent;
+use crate::DownloadObservation;
+#[cfg(feature = "serde")]
+use crate::observation::Phase;
 use crate::segment::Segment;
 #[cfg(feature = "serde")]
 use eyre::Context;
@@ -69,11 +72,21 @@ pub(crate) fn load_state(path: &Path) -> Result<DownloadState> {
 }
 
 #[cfg(feature = "serde")]
-pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>) -> Result<()> {
+pub(crate) async fn save_state(
+    output: &Path,
+    state: &TokioMutex<DownloadState>,
+    observation: Option<&DownloadObservation>,
+) -> Result<()> {
+    let _timing = observation.map(|observation| observation.timing(Phase::Checkpoint));
     let path = state_path(output)?;
     // Workers publish written progress only after flushing their Tokio file buffers.
     // Synchronize at least this snapshot's bytes before making it crash-reusable.
     let snapshot = state.lock().await.clone();
+    let crash_safe = snapshot
+        .segments
+        .iter()
+        .map(|segment| segment.downloaded)
+        .sum();
     let output = output.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
         use std::io::Write;
@@ -100,11 +113,22 @@ pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>)
         sync_parent(&path)
     })
     .await
-    .context("checkpoint task failed")?
+    .context("checkpoint task failed")??;
+    if let Some(observation) = observation {
+        observation.checkpoint(crash_safe);
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "serde"))]
-pub(crate) async fn save_state(output: &Path, state: &TokioMutex<DownloadState>) -> Result<()> {
+pub(crate) async fn save_state(
+    output: &Path,
+    state: &TokioMutex<DownloadState>,
+    observation: Option<&DownloadObservation>,
+) -> Result<()> {
+    if let Some(observation) = observation {
+        observation.checkpoint(0);
+    }
     let _ = output;
     let state = state.lock().await;
     let _ = (

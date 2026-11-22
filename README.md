@@ -86,12 +86,11 @@ documentation, and feature/MSRV checks.
 
 ## Next milestones
 
-The reliable resume/completion and safe-core API milestone is complete. Progress sampling also landed,
-but does **not** complete bounded diagnostics: an indefinitely stalled reader can still accumulate events.
+The reliable resume/completion, safe-core API, and bounded-observation milestones are implemented.
+Optional diagnostics use a dedicated OS thread; slow observers cannot back up the transfer path.
 
 The remaining foundation work is:
 
-2. Bounded observations and diagnostics on a dedicated thread.
 3. Configurable timeouts, retries, and flaky-link recovery.
 4. One persistent manager shared by server and explicit no-server operation.
 5. A secure single-owner server and bounded, reconnectable client API.

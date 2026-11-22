@@ -32,8 +32,9 @@ Use `arkama-cli download --help` for the full argument reference:
 | `-y, --yes` | Currently a no-op; does not authorize overwrite or change collision behavior. |
 
 The speed cap is shared across the workers of **one download**, not across all active daemon jobs.
-JSON progress and terminal updates are sampled at most once per 500 ms. The first sample and lifecycle
-events are immediate; the final completion result contains the exact byte count.
+JSON progress and terminal updates are sampled at most once per 500 ms. Optional core notifications
+use a bounded buffer and may be dropped under overload; the CLI obtains the exact final result from
+the independent completion handle.
 
 ## Pause and resume a direct download
 

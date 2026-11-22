@@ -42,7 +42,8 @@ All public download APIs run on the `tokio` async runtime:
 
 Background downloads return a `DownloadHandle` with:
 
-- `events`: an unbounded stream of `DownloadEvent` values.
+- `events`: an eight-event, best-effort stream of `DownloadEvent` values.
+- `observation`: current counters independent of event/collector availability.
 - `join`: the spawned task that resolves to `arkama_core::Result<DownloadSummary>`.
 - `control`: a `DownloadControl` for pause/cancel requests.
 
@@ -62,13 +63,40 @@ The CLI translates Ctrl+C into a pause request.
 - `Failed { message }`
 
 Progress is sampled at most once every 500 ms per download, shared across all workers, so the CLI
-does not queue or render an update for every chunk. The first progress sample and lifecycle events
-are immediate; intermediate samples are skipped without making workers wait. Completion still
-reports the exact final byte count through `join`. The event channel remains unbounded, so an
-indefinitely stalled reader can still accumulate these low-rate updates.
+does not queue or render an update for every chunk. Samples and lifecycle events are offered immediately
+without waiting for buffer capacity; overload drops events and increments `dropped_events`.
+Use `join` for authoritative completion and `observation.snapshot()` for current counters.
+Consumers explicitly naming `UnboundedReceiver` must change to `mpsc::Receiver`; `recv`/`try_recv`
+usage remains the same. Lifecycle notifications are optional, not acknowledgements.
 
 Pause and cancellation are surfaced as typed completion errors from `DownloadHandle::join`:
 `Error::Paused` and `Error::Cancelled`.
+
+## Bounded diagnostics
+
+`Diagnostics::start(handle.observation.clone(), DiagnosticsConfig::default())` starts an optional
+dedicated OS thread. It aggregates bounded speed history, samples process CPU/memory and optional
+disk space, and emits numeric, credential-free tracing observations using the host's dispatcher.
+Workers never invoke a tracing subscriber, collector sink, OS sampler, or export writer.
+
+`Diagnostics::with_sink` runs a host-provided sink on that same thread. Sink failure, blocked sinks,
+and slow/absent event readers cannot delay transfers or replace the `join` result. Collector snapshots
+expose lag, sink errors, history evictions, and gaps; interval speeds are unsmoothed and gaps/resets
+have no estimate. Defaults retain 120 samples at 500 ms; intervals must be 50 ms–60 s and retention
+1–10,000 samples. Dropping the collector requests stop without waiting; a blocked host sink must
+eventually return for its thread to exit.
+
+Measurements distinguish received HTTP **body** bytes, accepted written coverage, disk-write traffic,
+and checkpointed bytes. Disk-write traffic includes overwritten retry data; received counts exclude
+headers and do not claim wire-level accounting. Timings are inclusive; disk/throttle/retry durations
+sum worker time rather than exclusive wall-clock phases. Pending bytes cover known body chunks,
+not all HTTP/TLS/OS buffers. Process measurements are process-wide, never exact per-job usage.
+Allocated disk bytes are currently available on Unix only; unavailable OS measurements are `None`.
+Queue and paused durations belong to the manager that owns those states, not a stopped core attempt.
+
+Snapshots contain no request URLs, headers, cookies, filenames, or error strings. Hosts control export
+destinations and should keep exported snapshots bounded. Instrumentation has measurable resource cost;
+non-waiting producers do not imply zero CPU, memory, disk, or throughput overhead.
 
 ## Resume behavior
 

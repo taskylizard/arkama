@@ -1,4 +1,5 @@
 use super::state::{DownloadState, save_state};
+use crate::DownloadObservation;
 use eyre::{Context, Result};
 use std::error::Error;
 use std::fmt;
@@ -48,6 +49,7 @@ pub(crate) async fn wait_workers(
     output: &Path,
     mut controls: watch::Receiver<StopSignal>,
     worker_stop: watch::Sender<StopSignal>,
+    observation: &DownloadObservation,
 ) -> Result<()> {
     let mut failure = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -70,7 +72,7 @@ pub(crate) async fn wait_workers(
                 }
             }
             _ = ticker.tick(), if failure.is_none() => {
-                if let Err(err) = save_state(output, state).await {
+                if let Err(err) = save_state(output, state, Some(observation)).await {
                     failure = Some(err);
                     worker_stop.send_replace(StopSignal::Pause);
                 }

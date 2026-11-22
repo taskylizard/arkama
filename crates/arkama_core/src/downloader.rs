@@ -1,5 +1,6 @@
 //! Public download entry points and private transfer orchestration.
 
+use crate::DownloadObservation;
 use crate::error::{Error, Result};
 use crate::{DownloadControl, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary};
 use std::sync::{Arc, Mutex};
@@ -64,21 +65,32 @@ pub fn start_download_with_handle(
     handle: Handle,
     request: DownloadRequest,
 ) -> Result<DownloadHandle> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(8);
+    let observation = DownloadObservation::new();
+    let task_observation = observation.clone();
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
     let join_stop_tx = stop_tx.clone();
     let join = handle.spawn(async move {
-        download_inner(
+        let result = download_inner(
             request,
-            Some(Arc::new(EventSender::new(tx))),
+            Some(Arc::new(EventSender::new(tx, task_observation.clone()))),
             join_stop_tx,
             stop_rx,
+            task_observation.clone(),
         )
         .await
-        .map_err(map_download_error)
+        .map_err(map_download_error);
+        task_observation.finish(match &result {
+            Ok(_) => 1,
+            Err(Error::Paused) => 2,
+            Err(Error::Cancelled) => 3,
+            Err(_) => 4,
+        });
+        result
     });
     Ok(DownloadHandle {
         events: rx,
+        observation,
         join,
         control: DownloadControl { stop_tx },
     })
@@ -104,7 +116,7 @@ pub fn start_download_with_handle(
 /// ```
 pub async fn download(request: DownloadRequest) -> Result<DownloadSummary> {
     let (stop_tx, stop_rx) = watch::channel(StopSignal::None);
-    download_inner(request, None, stop_tx, stop_rx)
+    download_inner(request, None, stop_tx, stop_rx, DownloadObservation::new())
         .await
         .map_err(map_download_error)
 }
@@ -137,14 +149,16 @@ fn map_download_error(err: eyre::Report) -> Error {
 }
 
 struct EventSender {
-    sender: mpsc::UnboundedSender<DownloadEvent>,
+    sender: mpsc::Sender<DownloadEvent>,
+    observation: DownloadObservation,
     last_progress: Mutex<Option<Instant>>,
 }
 
 impl EventSender {
-    fn new(sender: mpsc::UnboundedSender<DownloadEvent>) -> Self {
+    fn new(sender: mpsc::Sender<DownloadEvent>, observation: DownloadObservation) -> Self {
         Self {
             sender,
+            observation,
             last_progress: Mutex::new(None),
         }
     }
@@ -155,21 +169,26 @@ fn send_event(events: &Option<Arc<EventSender>>, event: DownloadEvent) {
         return;
     };
     if sender.sender.is_closed() {
+        sender.observation.dropped();
         return;
     }
     if matches!(event, DownloadEvent::Progress { .. }) {
         // Skip optional samples on contention; workers never wait for reporting.
         let Ok(mut last_progress) = sender.last_progress.try_lock() else {
+            sender.observation.dropped();
             return;
         };
         let now = Instant::now();
         if last_progress.is_some_and(|last| now.duration_since(last) < Duration::from_millis(500)) {
+            sender.observation.suppressed();
             return;
         }
         *last_progress = Some(now);
-        let _ = sender.sender.send(event);
-    } else {
-        let _ = sender.sender.send(event);
+        if sender.sender.try_send(event).is_err() {
+            sender.observation.dropped();
+        }
+    } else if sender.sender.try_send(event).is_err() {
+        sender.observation.dropped();
     }
 }
 
@@ -288,12 +307,18 @@ mod tests {
 
     #[test]
     fn test_send_event_dispatches() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8);
         let event = DownloadEvent::Failed {
             message: "boom".to_string(),
         };
 
-        send_event(&Some(Arc::new(EventSender::new(tx))), event);
+        send_event(
+            &Some(Arc::new(EventSender::new(
+                tx,
+                crate::DownloadObservation::new(),
+            ))),
+            event,
+        );
         let received = rx.blocking_recv().expect("event");
         let DownloadEvent::Failed { message } = received else {
             panic!("unexpected event");
@@ -327,7 +352,7 @@ mod tests {
             experimental_entropy: false,
         };
         let state = TokioMutex::new(state);
-        save_state(&output, &state).await.expect("save ok");
+        save_state(&output, &state, None).await.expect("save ok");
 
         let state_path = output.with_file_name("file.bin.arkama.state");
         let saved = load_state(&state_path).expect("load state");

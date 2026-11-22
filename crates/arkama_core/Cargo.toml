@@ -35,6 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = [
   "fs",

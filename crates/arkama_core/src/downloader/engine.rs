@@ -6,14 +6,15 @@ use super::plan::{DownloadPlan, DownloadPlanConfig};
 use super::rate_limit::SpeedLimiter;
 use super::state::{load_state, state_path};
 use super::{EventSender, send_event};
+use crate::DownloadObservation;
 use crate::http::{self, ClientFactory};
+use crate::observation::Phase;
 use crate::{DownloadEvent, DownloadRequest, DownloadSummary};
 use eyre::{Context, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::watch;
-use tracing::{info, warn};
 use url::Url;
 
 pub(super) async fn download_inner(
@@ -21,7 +22,9 @@ pub(super) async fn download_inner(
     events: Option<Arc<EventSender>>,
     _keep_controls_alive: watch::Sender<StopSignal>,
     mut stop_rx: watch::Receiver<StopSignal>,
+    observation: DownloadObservation,
 ) -> Result<DownloadSummary> {
+    let setup = observation.timing(Phase::Setup);
     let DownloadRequest {
         url,
         output,
@@ -49,7 +52,7 @@ pub(super) async fn download_inner(
     let partial = sidecar_path(&output, ".arkama.part")?;
     let checkpoint = state_path(&partial)?;
     let resume = load_state(&checkpoint).ok();
-    let total_downloaded = Arc::new(AtomicU64::new(0));
+    let total_downloaded = observation.written();
     let mut plan = DownloadPlan::new(DownloadPlanConfig {
         url,
         output: partial.clone(),
@@ -61,10 +64,13 @@ pub(super) async fn download_inner(
         speed_limiter: limit.map(SpeedLimiter::new).map(Arc::new),
         events: events.clone(),
         total_downloaded: Arc::clone(&total_downloaded),
+        observation: observation.clone(),
         stop_rx: stop_rx.clone(),
     })?;
     let resumed = plan.already_downloaded();
     total_downloaded.store(resumed, Ordering::Relaxed);
+    observation.checkpoint(resumed);
+    drop(setup);
     send_event(
         &events,
         DownloadEvent::Started {
@@ -73,13 +79,16 @@ pub(super) async fn download_inner(
             resumed_bytes: resumed,
         },
     );
-    info!("download started");
     let started = Instant::now();
-    let result = plan.execute().await;
+    let result = {
+        let _transfer = observation.timing(Phase::Transfer);
+        plan.execute().await
+    };
     let signal = *stop_rx.borrow();
     if signal == StopSignal::Cancel {
         remove_if_exists(&checkpoint)?;
         remove_if_exists(&partial)?;
+        observation.checkpoint(0);
     }
     let result = if signal == StopSignal::Cancel || (signal == StopSignal::Pause && result.is_ok())
     {
@@ -89,6 +98,7 @@ pub(super) async fn download_inner(
     };
     match result {
         Ok(()) => {
+            let verification = observation.timing(Phase::Verification);
             let written = total_downloaded.load(Ordering::Relaxed);
             if partial.metadata()?.len() != written
                 || plan.total_size.is_some_and(|total| total != written)
@@ -97,8 +107,12 @@ pub(super) async fn download_inner(
                     "output length does not match verified transfer coverage"
                 ));
             }
-            publish_output(&partial, &output)?;
-            remove_if_exists(&checkpoint)?;
+            drop(verification);
+            {
+                let _publication = observation.timing(Phase::Publication);
+                publish_output(&partial, &output)?;
+                remove_if_exists(&checkpoint)?;
+            }
             let summary = DownloadSummary {
                 output,
                 total_bytes: written,
@@ -112,7 +126,6 @@ pub(super) async fn download_inner(
                     summary: summary.clone(),
                 },
             );
-            info!("download finished");
             Ok(summary)
         }
         Err(err) => {
@@ -122,7 +135,6 @@ pub(super) async fn download_inner(
                     message: err.to_string(),
                 },
             );
-            warn!("download failed");
             Err(err)
         }
     }

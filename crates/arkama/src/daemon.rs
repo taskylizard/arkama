@@ -51,7 +51,7 @@ pub enum DaemonCommand {
 struct ActiveDownload {
     id: i64,
     request: DownloadRequest,
-    receiver: tokio_mpsc::UnboundedReceiver<DownloadEvent>,
+    receiver: tokio_mpsc::Receiver<DownloadEvent>,
     done_rx: mpsc::Receiver<Result<DownloadSummary>>,
     control: DownloadControl,
     downloaded_bytes: u64,

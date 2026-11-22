@@ -7,6 +7,7 @@ use super::worker::{
     DownloadSegmentContext, DownloadSingleContext, RangeUnsupported, SlowestTracker,
     download_segment, download_single,
 };
+use crate::DownloadObservation;
 use crate::http::{ClientFactory, HttpMeta};
 use crate::segment::{Segment, build_segments, build_segments_with_chunk_size};
 use eyre::Result;
@@ -32,6 +33,7 @@ pub(crate) struct DownloadPlan {
     speed_limiter: Option<Arc<SpeedLimiter>>,
     events: Option<Arc<EventSender>>,
     total_downloaded: Arc<AtomicU64>,
+    observation: DownloadObservation,
     stop_rx: watch::Receiver<StopSignal>,
 }
 
@@ -46,6 +48,7 @@ pub(crate) struct DownloadPlanConfig {
     pub(crate) speed_limiter: Option<Arc<SpeedLimiter>>,
     pub(crate) events: Option<Arc<EventSender>>,
     pub(crate) total_downloaded: Arc<AtomicU64>,
+    pub(crate) observation: DownloadObservation,
     pub(crate) stop_rx: watch::Receiver<StopSignal>,
 }
 
@@ -62,6 +65,7 @@ impl DownloadPlan {
             speed_limiter,
             events,
             total_downloaded,
+            observation,
             stop_rx,
         } = config;
         let segment_size = experimental_entropy.then_some(EXPERIMENTAL_SEGMENT_SIZE);
@@ -124,6 +128,7 @@ impl DownloadPlan {
             speed_limiter,
             events,
             total_downloaded,
+            observation,
             stop_rx,
         })
     }
@@ -143,6 +148,7 @@ impl DownloadPlan {
                     prepare_output(&self.output, 0)?;
                     self.state.lock().await.segments.clear();
                     self.total_downloaded.store(0, Ordering::Relaxed);
+                    self.observation.checkpoint(0);
                     self.resumed_bytes = 0;
                     return self.execute_single().await;
                 }
@@ -155,7 +161,7 @@ impl DownloadPlan {
 
     async fn execute_segmented(&mut self) -> Result<()> {
         prepare_output(&self.output, self.total_size.expect("known size"))?;
-        save_state(&self.output, &self.state).await?;
+        save_state(&self.output, &self.state, Some(&self.observation)).await?;
         let segments = self.state.lock().await.segments.clone();
         let queue = Arc::new(TokioMutex::new(VecDeque::from(segments)));
         let (stop_tx, stop_rx) = watch::channel(*self.stop_rx.borrow());
@@ -174,6 +180,7 @@ impl DownloadPlan {
             events: self.events.clone(),
             total_downloaded: Arc::clone(&self.total_downloaded),
             total_size: self.total_size,
+            observation: self.observation.clone(),
         };
         let mut workers = JoinSet::new();
         for _ in 0..self.connections.min(queue.lock().await.len()) {
@@ -195,10 +202,11 @@ impl DownloadPlan {
             &self.output,
             self.stop_rx.clone(),
             stop_tx,
+            &self.observation,
         )
         .await;
         // Written positions become crash-reusable only after this durable publication.
-        save_state(&self.output, &self.state).await?;
+        save_state(&self.output, &self.state, Some(&self.observation)).await?;
         result?;
         let state = self.state.lock().await;
         if !state
@@ -221,6 +229,7 @@ impl DownloadPlan {
             events: self.events.clone(),
             total_downloaded: Arc::clone(&self.total_downloaded),
             total_size: self.total_size,
+            observation: self.observation.clone(),
         };
         download_single(context).await
     }

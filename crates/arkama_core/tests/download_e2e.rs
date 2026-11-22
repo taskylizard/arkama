@@ -32,7 +32,7 @@ fn partial_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.arkama.part", path.to_string_lossy()))
 }
 
-async fn wait_for_progress(events: &mut mpsc::UnboundedReceiver<DownloadEvent>) -> u64 {
+async fn wait_for_progress(events: &mut mpsc::Receiver<DownloadEvent>) -> u64 {
     loop {
         let next = timeout(Duration::from_secs(5), events.recv())
             .await
@@ -449,6 +449,127 @@ async fn progress_is_sampled_across_workers_without_losing_completion() {
 }
 
 #[tokio::test]
+async fn saturated_observations_and_stalled_diagnostics_do_not_block_completion() {
+    use arkama_core::{Diagnostics, DiagnosticsConfig};
+    let data = asymmetric_data(1_048_579);
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 1024;
+    config.chunk_delay = Duration::from_millis(5);
+    let server = FlakyServer::spawn(config).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stalled-reader.bin");
+    let handle = start_download(request(server.url(), path.clone(), 1)).unwrap();
+    let observation = handle.observation.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let mut entered_tx = Some(entered_tx);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let collector = Diagnostics::with_sink(
+        observation.clone(),
+        DiagnosticsConfig {
+            interval: Duration::from_millis(50),
+            history_capacity: 2,
+            disk_path: Some(dir.path().into()),
+        },
+        move |_| {
+            if let Some(entered) = entered_tx.take() {
+                let _ = entered.send(());
+                let _ = release_rx.recv();
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // Keep events unread while the dedicated sink is blocked. Waiting sends would deadlock here.
+    let result = timeout(Duration::from_secs(15), handle.join).await;
+    let lag = collector.snapshot().collector_lag_ms;
+    let _ = release_tx.send(());
+    let summary = result
+        .expect("download must not wait for observations")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.downloaded_bytes, data.len() as u64);
+    assert_downloaded(&path, &data).await;
+    assert_eq!(handle.events.len(), 8);
+    let snapshot = observation.snapshot();
+    assert!(snapshot.dropped_events > 0);
+    assert!(lag > 1000);
+    assert_eq!(snapshot.outcome, "complete");
+    assert_eq!(snapshot.written_bytes, data.len() as u64);
+    assert_eq!(snapshot.received_bytes, data.len() as u64);
+    assert_eq!(snapshot.disk_written_bytes, data.len() as u64);
+    assert_eq!(
+        snapshot.crash_safe_bytes,
+        if cfg!(feature = "serde") {
+            data.len() as u64
+        } else {
+            0
+        }
+    );
+    assert_eq!(snapshot.active_workers, 0);
+    assert_eq!(snapshot.pending_bytes, 0);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(gap) = collector
+                .snapshot()
+                .history
+                .iter()
+                .find(|sample| sample.gap)
+            {
+                assert_eq!(gap.bytes_per_second, None);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("collector must expose its gap after resuming");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let retained = collector.snapshot();
+    assert_eq!(retained.history.len(), 2);
+    assert!(retained.evicted_samples > 0);
+    assert!(retained.process_memory_bytes.is_some());
+    assert!(retained.disk_available_bytes.is_some());
+}
+
+#[tokio::test]
+async fn failed_diagnostic_sink_retains_bounded_history_and_correct_bytes() {
+    use arkama_core::{Diagnostics, DiagnosticsConfig};
+    let data = asymmetric_data(131_075);
+    let mut config = FlakyServerConfig::new(data.clone());
+    config.chunk_size = 1024;
+    config.chunk_delay = Duration::from_millis(5);
+    let server = FlakyServer::spawn(config).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("failed-sink.bin");
+    let handle = start_download(request(server.url(), path.clone(), 1)).unwrap();
+    let diagnostics = Diagnostics::with_sink(
+        handle.observation.clone(),
+        DiagnosticsConfig {
+            interval: Duration::from_millis(50),
+            history_capacity: 2,
+            disk_path: None,
+        },
+        |_| Err(std::io::Error::other("sink unavailable")),
+    )
+    .unwrap();
+    drop(handle.events);
+    timeout(Duration::from_secs(5), handle.join)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_downloaded(&path, &data).await;
+    let snapshot = diagnostics.snapshot();
+    assert_eq!(snapshot.history.len(), 2);
+    assert!(snapshot.evicted_samples > 0);
+    assert!(snapshot.sink_errors > 0);
+}
+
+#[tokio::test]
 async fn download_single_throttled_without_ranges() {
     let data = vec![42u8; 512 * 1024];
     let mut config = FlakyServerConfig::new(data.clone());
@@ -474,7 +595,7 @@ async fn download_single_throttled_without_ranges() {
 
 #[tokio::test]
 async fn download_single_restarts_after_interrupted_non_range_stream() {
-    let data = vec![7u8; 256 * 1024];
+    let data = asymmetric_data(262_147);
     let mut config = FlakyServerConfig::new(data.clone());
     config.accept_ranges = false;
     config.chunk_size = 32 * 1024;
@@ -486,10 +607,20 @@ async fn download_single_restarts_after_interrupted_non_range_stream() {
     let path = temp_dir.path().join("restart.bin");
 
     let req = request(server.url(), path.clone(), 4);
-    let summary = download(req).await.expect("single restart download");
+    let handle = start_download(req).unwrap();
+    let observation = handle.observation.clone();
+    drop(handle.events);
+    let summary = handle.join.await.unwrap().expect("single restart download");
     assert_eq!(summary.total_bytes, data.len() as u64);
     assert_eq!(summary.downloaded_bytes, data.len() as u64);
     assert_downloaded(&path, &data).await;
+    let observed = observation.snapshot();
+    assert_eq!(observed.written_bytes, data.len() as u64);
+    assert!(observed.received_bytes > observed.written_bytes);
+    assert_eq!(observed.disk_written_bytes, observed.received_bytes);
+    assert_eq!(observed.crash_safe_bytes, 0);
+    assert_eq!(observed.retries, 1);
+    assert!(observed.durations_ms["retry_wait"] >= 900);
 
     let stats = server.stats();
     assert_eq!(stats.head_requests, 1);

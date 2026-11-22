@@ -6,13 +6,15 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::DownloadObservation;
 use crate::downloader::StopSignal;
 use crate::error::Result;
 
 /// Reports lifecycle updates for a download.
 ///
 /// Progress is sampled at most once every 500 ms per download, shared across workers.
-/// The first sample and lifecycle events are immediate; completion is authoritative through `join`.
+/// The eight-event buffer drops optional events on overload. Completion is authoritative through
+/// `join`; current measurements remain available through `observation` even when events are lost.
 ///
 /// # Examples
 ///
@@ -73,7 +75,8 @@ pub struct DownloadSummary {
 /// Await `join` to acknowledge completion or shutdown. Dropping the handle detaches the task;
 /// aborting `join` is not a coordinated pause/cancel and must not be used for shutdown.
 pub struct DownloadHandle {
-    pub events: mpsc::UnboundedReceiver<DownloadEvent>,
+    pub events: mpsc::Receiver<DownloadEvent>,
+    pub observation: DownloadObservation,
     pub join: JoinHandle<Result<DownloadSummary>>,
     pub control: DownloadControl,
 }
